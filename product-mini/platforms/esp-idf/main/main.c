@@ -12,6 +12,8 @@
 
 #include "esp_log.h"
 
+#define IWASM_MAIN_STACK_SIZE 5120
+
 #define LOG_TAG "wamr"
 
 static void *
@@ -146,7 +148,7 @@ app_main(void)
     pthread_attr_t tattr;
     pthread_attr_init(&tattr);
     pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_JOINABLE);
-    pthread_attr_setstacksize(&tattr, 4096);
+    pthread_attr_setstacksize(&tattr, IWASM_MAIN_STACK_SIZE);
 
     res = pthread_create(&t, &tattr, iwasm_main, (void *)NULL);
     assert(res == 0);

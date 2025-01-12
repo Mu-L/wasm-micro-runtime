@@ -10,39 +10,44 @@
 
 /* clang-format off */
 /* for soft-float */
-void __floatsidf();
-void __divdf3();
-void __ltdf2();
+void __floatsidf(void);
+void __divdf3(void);
+void __ltdf2(void);
 
 /* for mul32 */
-void __mulsi3();
-void __muldi3();
+void __mulsi3(void);
+void __muldi3(void);
 
-void __modsi3();
+void __modsi3(void);
 
-void __divdi3();
+void __divdi3(void);
 
-void __udivdi3();
-void __unorddf2();
-void __adddf3();
-void __eqdf2();
-void __muldf3();
-void __gedf2();
-void __ledf2();
-void __fixunsdfsi();
-void __floatunsidf();
-void __subdf3();
-void __nedf2();
-void __fixdfsi();
-void __moddi3();
-void __extendsfdf2();
-void __truncdfsf2();
-void __gtdf2();
-void __umoddi3();
-void __floatdidf();
-void __divsf3();
-void __fixdfdi();
-void __floatundidf();
+void __udivdi3(void);
+void __unorddf2(void);
+void __adddf3(void);
+void __eqdf2(void);
+void __muldf3(void);
+void __gedf2(void);
+void __ledf2(void);
+void __fixunsdfsi(void);
+void __floatunsidf(void);
+void __subdf3(void);
+void __nedf2(void);
+void __fixdfsi(void);
+void __moddi3(void);
+void __extendsfdf2(void);
+void __truncdfsf2(void);
+void __gtdf2(void);
+void __umoddi3(void);
+void __floatdidf(void);
+void __divsf3(void);
+void __fixdfdi(void);
+void __floatundidf(void);
+void __fixsfdi(void);
+void __fixunssfdi(void);
+void __fixunsdfdi(void);
+void __floatdisf(void);
+void __floatundisf(void);
 
 
 static SymbolMap target_sym_map[] = {
@@ -85,6 +90,11 @@ static SymbolMap target_sym_map[] = {
     REG_SYM(__divsf3),
     REG_SYM(__fixdfdi),
     REG_SYM(__floatundidf),
+    REG_SYM(__fixsfdi),
+    REG_SYM(__fixunssfdi),
+    REG_SYM(__fixunsdfdi),
+    REG_SYM(__floatdisf),
+    REG_SYM(__floatundisf),
 };
 /* clang-format on */
 
@@ -109,7 +119,7 @@ get_current_target(char *target_buf, uint32 target_buf_size)
 }
 
 static uint32
-get_plt_item_size()
+get_plt_item_size(void)
 {
     return 0;
 }
@@ -207,6 +217,10 @@ apply_relocation(AOTModule *module, uint8 *target_section_addr,
         case R_XTENSA_32:
         {
             uint8 *insn_addr = target_section_addr + reloc_offset;
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+            insn_addr = os_get_dbus_mirror((void *)insn_addr);
+            bh_assert(insn_addr != NULL);
+#endif
             int32 initial_addend;
             /* (S + A) */
             if ((intptr_t)insn_addr & 3) {
@@ -265,6 +279,11 @@ apply_relocation(AOTModule *module, uint8 *target_section_addr,
                 return false;
             }
 
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+            insn_addr = os_get_dbus_mirror((void *)insn_addr);
+            bh_assert(insn_addr != NULL);
+            l32r_insn = (l32r_insn_t *)insn_addr;
+#endif
             imm16 = (int16)(relative_offset >> 2);
 
             /* write back the imm16 to the l32r instruction */
@@ -285,7 +304,6 @@ apply_relocation(AOTModule *module, uint8 *target_section_addr,
 #if __GNUC__ >= 9
 #pragma GCC diagnostic pop
 #endif
-
             break;
         }
 
@@ -294,7 +312,7 @@ apply_relocation(AOTModule *module, uint8 *target_section_addr,
                 snprintf(error_buf, error_buf_size,
                          "Load relocation section failed: "
                          "invalid relocation type %d.",
-                         reloc_type);
+                         (int)reloc_type);
             return false;
     }
 

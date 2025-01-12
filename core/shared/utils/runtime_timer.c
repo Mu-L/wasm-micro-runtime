@@ -38,7 +38,7 @@ struct _timer_ctx {
 uint64
 bh_get_tick_ms()
 {
-    return os_time_get_boot_microsecond() / 1000;
+    return os_time_get_boot_us() / 1000;
 }
 
 uint32
@@ -394,7 +394,7 @@ handle_expired_timers(timer_ctx_t ctx, app_timer_t *expired)
            operation may change expired->next */
         expired = expired->next;
         if (t->is_periodic) {
-            /* if it is repeating, then reschedule it; */
+            /* if it is repeating, then reschedule it */
             reschedule_timer(ctx, t);
         }
         else {

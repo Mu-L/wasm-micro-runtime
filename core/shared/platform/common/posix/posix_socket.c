@@ -5,6 +5,7 @@
 
 #include "platform_api_vmcore.h"
 #include "platform_api_extension.h"
+#include "libc_errno.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -44,7 +45,7 @@ textual_addr_to_sockaddr(const char *textual, int port, struct sockaddr *out,
 }
 
 static int
-sockaddr_to_bh_sockaddr(const struct sockaddr *sockaddr, socklen_t socklen,
+sockaddr_to_bh_sockaddr(const struct sockaddr *sockaddr,
                         bh_sockaddr_t *bh_sockaddr)
 {
     switch (sockaddr->sa_family) {
@@ -52,10 +53,8 @@ sockaddr_to_bh_sockaddr(const struct sockaddr *sockaddr, socklen_t socklen,
         {
             struct sockaddr_in *addr = (struct sockaddr_in *)sockaddr;
 
-            assert(socklen >= sizeof(struct sockaddr_in));
-
             bh_sockaddr->port = ntohs(addr->sin_port);
-            bh_sockaddr->addr_bufer.ipv4 = ntohl(addr->sin_addr.s_addr);
+            bh_sockaddr->addr_buffer.ipv4 = ntohl(addr->sin_addr.s_addr);
             bh_sockaddr->is_ipv4 = true;
             return BHT_OK;
         }
@@ -65,16 +64,14 @@ sockaddr_to_bh_sockaddr(const struct sockaddr *sockaddr, socklen_t socklen,
             struct sockaddr_in6 *addr = (struct sockaddr_in6 *)sockaddr;
             size_t i;
 
-            assert(socklen >= sizeof(struct sockaddr_in6));
-
             bh_sockaddr->port = ntohs(addr->sin6_port);
 
-            for (i = 0; i < sizeof(bh_sockaddr->addr_bufer.ipv6)
-                                / sizeof(bh_sockaddr->addr_bufer.ipv6[0]);
+            for (i = 0; i < sizeof(bh_sockaddr->addr_buffer.ipv6)
+                                / sizeof(bh_sockaddr->addr_buffer.ipv6[0]);
                  i++) {
                 uint16 part_addr = addr->sin6_addr.s6_addr[i * 2]
                                    | (addr->sin6_addr.s6_addr[i * 2 + 1] << 8);
-                bh_sockaddr->addr_bufer.ipv6[i] = ntohs(part_addr);
+                bh_sockaddr->addr_buffer.ipv6[i] = ntohs(part_addr);
             }
 
             bh_sockaddr->is_ipv4 = false;
@@ -95,7 +92,7 @@ bh_sockaddr_to_sockaddr(const bh_sockaddr_t *bh_sockaddr,
         struct sockaddr_in *addr = (struct sockaddr_in *)sockaddr;
         addr->sin_port = htons(bh_sockaddr->port);
         addr->sin_family = AF_INET;
-        addr->sin_addr.s_addr = htonl(bh_sockaddr->addr_bufer.ipv4);
+        addr->sin_addr.s_addr = htonl(bh_sockaddr->addr_buffer.ipv4);
         *socklen = sizeof(*addr);
     }
 #ifdef IPPROTO_IPV6
@@ -105,10 +102,10 @@ bh_sockaddr_to_sockaddr(const bh_sockaddr_t *bh_sockaddr,
         addr->sin6_port = htons(bh_sockaddr->port);
         addr->sin6_family = AF_INET6;
 
-        for (i = 0; i < sizeof(bh_sockaddr->addr_bufer.ipv6)
-                            / sizeof(bh_sockaddr->addr_bufer.ipv6[0]);
+        for (i = 0; i < sizeof(bh_sockaddr->addr_buffer.ipv6)
+                            / sizeof(bh_sockaddr->addr_buffer.ipv6[0]);
              i++) {
-            uint16 part_addr = htons(bh_sockaddr->addr_bufer.ipv6[i]);
+            uint16 part_addr = htons(bh_sockaddr->addr_buffer.ipv6[i]);
             addr->sin6_addr.s6_addr[i * 2] = 0xff & part_addr;
             addr->sin6_addr.s6_addr[i * 2 + 1] = (0xff00 & part_addr) >> 8;
         }
@@ -156,17 +153,6 @@ os_socket_bind(bh_socket_t socket, const char *host, int *port)
         goto fail;
     }
 
-    if (addr.ss_family == AF_INET) {
-        *port = ntohs(((struct sockaddr_in *)&addr)->sin_port);
-    }
-    else {
-#ifdef IPPROTO_IPV6
-        *port = ntohs(((struct sockaddr_in6 *)&addr)->sin6_port);
-#else
-        goto fail;
-#endif
-    }
-
     ret = fcntl(socket, F_SETFD, FD_CLOEXEC);
     if (ret < 0) {
         goto fail;
@@ -185,6 +171,17 @@ os_socket_bind(bh_socket_t socket, const char *host, int *port)
     socklen = sizeof(addr);
     if (getsockname(socket, (void *)&addr, &socklen) == -1) {
         goto fail;
+    }
+
+    if (addr.ss_family == AF_INET) {
+        *port = ntohs(((struct sockaddr_in *)&addr)->sin_port);
+    }
+    else {
+#ifdef IPPROTO_IPV6
+        *port = ntohs(((struct sockaddr_in6 *)&addr)->sin6_port);
+#else
+        goto fail;
+#endif
     }
 
     return BHT_OK;
@@ -274,11 +271,13 @@ os_socket_recv_from(bh_socket_t socket, void *buf, unsigned int len, int flags,
     }
 
     if (src_addr && socklen > 0) {
-        if (sockaddr_to_bh_sockaddr((struct sockaddr *)&sock_addr, socklen,
-                                    src_addr)
+        if (sockaddr_to_bh_sockaddr((struct sockaddr *)&sock_addr, src_addr)
             == BHT_ERROR) {
             return -1;
         }
+    }
+    else if (src_addr) {
+        memset(src_addr, 0, sizeof(*src_addr));
     }
 
     return ret;
@@ -310,11 +309,13 @@ os_socket_close(bh_socket_t socket)
     return BHT_OK;
 }
 
-int
+__wasi_errno_t
 os_socket_shutdown(bh_socket_t socket)
 {
-    shutdown(socket, O_RDWR);
-    return BHT_OK;
+    if (shutdown(socket, O_RDWR) != 0) {
+        return convert_errno(errno);
+    }
+    return __WASI_ESUCCESS;
 }
 
 int
@@ -411,9 +412,8 @@ os_socket_addr_resolve(const char *host, const char *service,
                 continue;
             }
 
-            ret = sockaddr_to_bh_sockaddr(res->ai_addr,
-                                          sizeof(struct sockaddr_in),
-                                          &addr_info[pos].sockaddr);
+            ret =
+                sockaddr_to_bh_sockaddr(res->ai_addr, &addr_info[pos].sockaddr);
 
             if (ret == BHT_ERROR) {
                 freeaddrinfo(result);
@@ -802,7 +802,7 @@ os_socket_set_ip_add_membership(bh_socket_t socket,
 {
     assert(imr_multiaddr);
     if (is_ipv6) {
-#ifdef IPPROTO_IPV6
+#if defined(IPPROTO_IPV6) && !defined(BH_PLATFORM_COSMOPOLITAN)
         struct ipv6_mreq mreq;
         for (int i = 0; i < 8; i++) {
             ((uint16_t *)mreq.ipv6mr_multiaddr.s6_addr)[i] =
@@ -840,7 +840,7 @@ os_socket_set_ip_drop_membership(bh_socket_t socket,
 {
     assert(imr_multiaddr);
     if (is_ipv6) {
-#ifdef IPPROTO_IPV6
+#if defined(IPPROTO_IPV6) && !defined(BH_PLATFORM_COSMOPOLITAN)
         struct ipv6_mreq mreq;
         for (int i = 0; i < 8; i++) {
             ((uint16_t *)mreq.ipv6mr_multiaddr.s6_addr)[i] =
@@ -884,7 +884,7 @@ os_socket_set_ip_ttl(bh_socket_t socket, uint8_t ttl_s)
 int
 os_socket_get_ip_ttl(bh_socket_t socket, uint8_t *ttl_s)
 {
-    socklen_t opt_len = sizeof(ttl_s);
+    socklen_t opt_len = sizeof(*ttl_s);
     if (getsockopt(socket, IPPROTO_IP, IP_TTL, ttl_s, &opt_len) != 0) {
         return BHT_ERROR;
     }
@@ -906,7 +906,7 @@ os_socket_set_ip_multicast_ttl(bh_socket_t socket, uint8_t ttl_s)
 int
 os_socket_get_ip_multicast_ttl(bh_socket_t socket, uint8_t *ttl_s)
 {
-    socklen_t opt_len = sizeof(ttl_s);
+    socklen_t opt_len = sizeof(*ttl_s);
     if (getsockopt(socket, IPPROTO_IP, IP_MULTICAST_TTL, ttl_s, &opt_len)
         != 0) {
         return BHT_ERROR;
@@ -1014,8 +1014,7 @@ os_socket_addr_local(bh_socket_t socket, bh_sockaddr_t *sockaddr)
         return BHT_ERROR;
     }
 
-    return sockaddr_to_bh_sockaddr((struct sockaddr *)&addr_storage, addr_len,
-                                   sockaddr);
+    return sockaddr_to_bh_sockaddr((struct sockaddr *)&addr_storage, sockaddr);
 }
 
 int
@@ -1031,6 +1030,5 @@ os_socket_addr_remote(bh_socket_t socket, bh_sockaddr_t *sockaddr)
         return BHT_ERROR;
     }
 
-    return sockaddr_to_bh_sockaddr((struct sockaddr *)&addr_storage, addr_len,
-                                   sockaddr);
+    return sockaddr_to_bh_sockaddr((struct sockaddr *)&addr_storage, sockaddr);
 }

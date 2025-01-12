@@ -30,7 +30,7 @@
 
 #define BUILD_COND_BR(value_if, block_then, block_else)                       \
     do {                                                                      \
-        if (!GEN_INSN(CMP, cc->cmp_reg, value_if, NEW_CONST(cc, 0))           \
+        if (!GEN_INSN(CMP, cc->cmp_reg, value_if, NEW_CONST(I32, 0))          \
             || !GEN_INSN(BNE, cc->cmp_reg, jit_basic_block_label(block_then), \
                          jit_basic_block_label(block_else))) {                \
             jit_set_last_error(cc, "generate bne insn failed");               \
@@ -396,8 +396,8 @@ handle_func_return(JitCompContext *cc, JitBlock *block)
 #endif
 
 #if WASM_ENABLE_PERF_PROFILING != 0
-    /* time_end = os_time_get_boot_microsecond() */
-    if (!jit_emit_callnative(cc, os_time_get_boot_microsecond, time_end, NULL,
+    /* time_end = os_time_thread_cputime_us() */
+    if (!jit_emit_callnative(cc, os_time_thread_cputime_us, time_end, NULL,
                              0)) {
         return false;
     }
@@ -450,9 +450,9 @@ handle_func_return(JitCompContext *cc, JitBlock *block)
     }
 
     /* Free stack space of the current frame:
-       exec_env->wasm_stack.s.top = cur_frame */
+       exec_env->wasm_stack.top = cur_frame */
     GEN_INSN(STPTR, cc->fp_reg, cc->exec_env_reg,
-             NEW_CONST(I32, offsetof(WASMExecEnv, wasm_stack.s.top)));
+             NEW_CONST(I32, offsetof(WASMExecEnv, wasm_stack.top)));
     /* Set the prev_frame as the current frame:
        exec_env->cur_frame = prev_frame */
     GEN_INSN(STPTR, prev_frame, cc->exec_env_reg,
@@ -808,7 +808,7 @@ jit_compile_op_block(JitCompContext *cc, uint8 **p_frame_ip,
     else if (label_type == LABEL_TYPE_IF) {
         POP_I32(value);
 
-        if (!jit_reg_is_const_val(value)) {
+        if (!jit_reg_is_const(value)) {
             /* Compare value is not constant, create condition br IR */
 
             /* Create entry block */
@@ -904,6 +904,42 @@ check_copy_arities(const JitBlock *block_dst, JitFrame *jit_frame)
     }
 }
 
+#if WASM_ENABLE_THREAD_MGR != 0
+bool
+jit_check_suspend_flags(JitCompContext *cc)
+{
+    JitReg exec_env, suspend_flags, terminate_flag, offset;
+    JitBasicBlock *terminate_block, *cur_basic_block;
+    JitFrame *jit_frame = cc->jit_frame;
+
+    cur_basic_block = cc->cur_basic_block;
+    terminate_block = jit_cc_new_basic_block(cc, 0);
+    if (!terminate_block) {
+        return false;
+    }
+
+    gen_commit_values(jit_frame, jit_frame->lp, jit_frame->sp);
+    exec_env = cc->exec_env_reg;
+    suspend_flags = jit_cc_new_reg_I32(cc);
+    terminate_flag = jit_cc_new_reg_I32(cc);
+
+    offset = jit_cc_new_const_I32(cc, offsetof(WASMExecEnv, suspend_flags));
+    GEN_INSN(LDI32, suspend_flags, exec_env, offset);
+    GEN_INSN(AND, terminate_flag, suspend_flags, NEW_CONST(I32, 1));
+
+    GEN_INSN(CMP, cc->cmp_reg, terminate_flag, NEW_CONST(I32, 0));
+    GEN_INSN(BNE, cc->cmp_reg, jit_basic_block_label(terminate_block), 0);
+
+    cc->cur_basic_block = terminate_block;
+    GEN_INSN(RETURN, NEW_CONST(I32, 0));
+
+    cc->cur_basic_block = cur_basic_block;
+
+    return true;
+}
+
+#endif
+
 static bool
 handle_op_br(JitCompContext *cc, uint32 br_depth, uint8 **p_frame_ip)
 {
@@ -986,6 +1022,13 @@ fail:
 bool
 jit_compile_op_br(JitCompContext *cc, uint32 br_depth, uint8 **p_frame_ip)
 {
+
+#if WASM_ENABLE_THREAD_MGR != 0
+    /* Insert suspend check point */
+    if (!jit_check_suspend_flags(cc))
+        return false;
+#endif
+
     return handle_op_br(cc, br_depth, p_frame_ip)
            && handle_next_reachable_block(cc, p_frame_ip);
 }
@@ -1059,7 +1102,7 @@ jit_compile_op_br_if(JitCompContext *cc, uint32 br_depth,
         }
     }
 
-    /* Only opy parameters or results when their count > 0 and
+    /* Only copy parameters or results when their count > 0 and
        the src/dst addr are different */
     copy_arities = check_copy_arities(block_dst, jit_frame);
 
@@ -1105,6 +1148,12 @@ jit_compile_op_br_if(JitCompContext *cc, uint32 br_depth,
         jit_insn_delete(insn_select);
     }
 
+#if WASM_ENABLE_THREAD_MGR != 0
+    /* Insert suspend check point */
+    if (!jit_check_suspend_flags(cc))
+        return false;
+#endif
+
     SET_BUILDER_POS(if_basic_block);
     SET_BB_BEGIN_BCIP(if_basic_block, *p_frame_ip - 1);
 
@@ -1143,6 +1192,12 @@ jit_compile_op_br_table(JitCompContext *cc, uint32 *br_depths, uint32 br_count,
     JitInsn *insn;
     uint32 i = 0;
     JitOpndLookupSwitch *opnd = NULL;
+
+#if WASM_ENABLE_THREAD_MGR != 0
+    /* Insert suspend check point */
+    if (!jit_check_suspend_flags(cc))
+        return false;
+#endif
 
     cur_basic_block = cc->cur_basic_block;
 

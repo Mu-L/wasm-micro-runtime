@@ -6,7 +6,7 @@
 
 import argparse
 import multiprocessing as mp
-import os
+import platform
 import pathlib
 import subprocess
 import sys
@@ -14,34 +14,60 @@ import time
 
 """
 The script itself has to be put under the same directory with the "spec".
+To run a single non-GC case with interpreter mode:
+  cd workspace
+  python3 runtest.py --wast2wasm wabt/bin/wat2wasm --interpreter iwasm \
+    spec/test/core/xxx.wast
+To run a single non-GC case with aot mode:
+  cd workspace
+  python3 runtest.py --aot --wast2wasm wabt/bin/wat2wasm --interpreter iwasm \
+    --aot-compiler wamrc spec/test/core/xxx.wast
+To run a single GC case case:
+  cd workspace
+  python3 runtest.py --wast2wasm spec/interpreter/wasm --interpreter iwasm \
+    --aot-compiler wamrc --gc spec/test/core/xxx.wast
 """
 
-PLATFORM_NAME = os.uname().sysname.lower()
-IWASM_CMD = "../../../product-mini/platforms/" + PLATFORM_NAME + "/build/iwasm"
+def exe_file_path(base_path: str) -> str:
+    if platform.system().lower() == "windows":
+        base_path += ".exe"
+    return base_path
+
+def get_iwasm_cmd(platform: str) -> str:
+    build_path = "../../../product-mini/platforms/" + platform + "/build/"
+    exe_name = "iwasm"
+
+    if platform == "windows":
+        build_path += "RelWithDebInfo/"
+
+    return exe_file_path(build_path + exe_name)
+
+PLATFORM_NAME = platform.uname().system.lower()
+IWASM_CMD = get_iwasm_cmd(PLATFORM_NAME)
 IWASM_SGX_CMD = "../../../product-mini/platforms/linux-sgx/enclave-sample/iwasm"
 IWASM_QEMU_CMD = "iwasm"
 SPEC_TEST_DIR = "spec/test/core"
-WAST2WASM_CMD = "./wabt/out/gcc/Release/wat2wasm"
+WAST2WASM_CMD = exe_file_path("./wabt/out/gcc/Release/wat2wasm")
+SPEC_INTERPRETER_CMD = "spec/interpreter/wasm"
 WAMRC_CMD = "../../../wamr-compiler/build/wamrc"
-
-
-class TargetAction(argparse.Action):
-    TARGET_MAP = {
-        "ARMV7_VFP": "armv7",
-        "RISCV32": "riscv32_ilp32",
-        "RISCV32_ILP32": "riscv32_ilp32",
-        "RISCV32_ILP32D": "riscv32_ilp32d",
-        "RISCV64": "riscv64_lp64",
-        "RISCV64_LP64": "riscv64_lp64",
-        "RISCV64_LP64D": "riscv64_lp64",
-        "THUMBV7_VFP": "thumbv7",
-        "X86_32": "i386",
-        "X86_64": "x86_64",
-    }
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, self.TARGET_MAP.get(values, "x86_64"))
-
+AVAILABLE_TARGETS = [
+    "I386",
+    "X86_32",
+    "X86_64",
+    "AARCH64",
+    "AARCH64_VFP",
+    "ARMV7",
+    "ARMV7_VFP",
+    "RISCV32",
+    "RISCV32_ILP32F",
+    "RISCV32_ILP32D",
+    "RISCV64",
+    "RISCV64_LP64F",
+    "RISCV64_LP64D",
+    "THUMBV7",
+    "THUMBV7_VFP",
+    "XTENSA",
+]
 
 def ignore_the_case(
     case_name,
@@ -51,17 +77,31 @@ def ignore_the_case(
     multi_module_flag=False,
     multi_thread_flag=False,
     simd_flag=False,
+    gc_flag=False,
+    memory64_flag=False,
+    multi_memory_flag=False,
     xip_flag=False,
-    qemu_flag=False
+    eh_flag=False,
+    qemu_flag=False,
 ):
+
     if case_name in ["comments", "inline-module", "names"]:
         return True
 
-    if not multi_module_flag and case_name in ["imports", "linking"]:
+    if not multi_module_flag and case_name in ["imports", "linking", "simd_linking"]:
         return True
 
-    if "i386" == target and case_name in ["float_exprs"]:
+    # Note: x87 doesn't preserve sNaN and makes some relevant tests fail.
+    if "i386" == target and case_name in ["float_exprs", "conversions"]:
         return True
+
+    # esp32s3 qemu doesn't have PSRAM emulation
+    if qemu_flag and target == 'xtensa' and case_name in ["memory_size"]:
+        return True
+
+    if gc_flag:
+        if case_name in ["array_init_elem", "array_init_data"]:
+            return True
 
     if sgx_flag:
         if case_name in ["conversions", "f32_bitwise", "f64_bitwise"]:
@@ -76,13 +116,26 @@ def ignore_the_case(
             return True
 
     if qemu_flag:
-        if case_name in ["f32_bitwise", "f64_bitwise", "loop", "f64", "f64_cmp", "conversions", "f32", "f32_cmp", "float_exprs", "float_misc", "select", "memory_grow"]:
+        if case_name in [
+            "f32_bitwise",
+            "f64_bitwise",
+            "loop",
+            "f64",
+            "f64_cmp",
+            "conversions",
+            "f32",
+            "f32_cmp",
+            "float_exprs",
+            "float_misc",
+            "select",
+            "memory_grow",
+        ]:
             return True
 
     return False
 
 
-def preflight_check(aot_flag):
+def preflight_check(aot_flag, aot_compiler, eh_flag):
     if not pathlib.Path(SPEC_TEST_DIR).resolve().exists():
         print(f"Can not find {SPEC_TEST_DIR}")
         return False
@@ -91,8 +144,8 @@ def preflight_check(aot_flag):
         print(f"Can not find {WAST2WASM_CMD}")
         return False
 
-    if aot_flag and not pathlib.Path(WAMRC_CMD).resolve().exists():
-        print(f"Can not find {WAMRC_CMD}")
+    if aot_flag and not pathlib.Path(aot_compiler).resolve().exists():
+        print(f"Can not find {aot_compiler}")
         return False
 
     return True
@@ -102,35 +155,26 @@ def test_case(
     case_path,
     target,
     aot_flag=False,
+    aot_compiler=WAMRC_CMD,
     sgx_flag=False,
     multi_module_flag=False,
     multi_thread_flag=False,
     simd_flag=False,
     xip_flag=False,
+    eh_flag=False,
     clean_up_flag=True,
     verbose_flag=True,
+    gc_flag=False,
+    memory64_flag=False,
+    multi_memory_flag=False,
     qemu_flag=False,
-    qemu_firmware='',
+    qemu_firmware="",
+    log="",
+    no_pty=False
 ):
-    case_path = pathlib.Path(case_path).resolve()
-    case_name = case_path.stem
-
-    if ignore_the_case(
-        case_name,
-        target,
-        aot_flag,
-        sgx_flag,
-        multi_module_flag,
-        multi_thread_flag,
-        simd_flag,
-        xip_flag,
-        qemu_flag
-    ):
-        return True
-
-    CMD = ["python3", "runtest.py"]
+    CMD = [sys.executable, "runtest.py"]
     CMD.append("--wast2wasm")
-    CMD.append(WAST2WASM_CMD)
+    CMD.append(WAST2WASM_CMD if not gc_flag else SPEC_INTERPRETER_CMD)
     CMD.append("--interpreter")
     if sgx_flag:
         CMD.append(IWASM_SGX_CMD)
@@ -138,8 +182,10 @@ def test_case(
         CMD.append(IWASM_QEMU_CMD)
     else:
         CMD.append(IWASM_CMD)
+    if no_pty:
+        CMD.append("--no-pty")
     CMD.append("--aot-compiler")
-    CMD.append(WAMRC_CMD)
+    CMD.append(aot_compiler)
 
     if aot_flag:
         CMD.append("--aot")
@@ -162,6 +208,9 @@ def test_case(
     if xip_flag:
         CMD.append("--xip")
 
+    if eh_flag:
+        CMD.append("--eh")
+
     if qemu_flag:
         CMD.append("--qemu")
         CMD.append("--qemu-firmware")
@@ -170,7 +219,24 @@ def test_case(
     if not clean_up_flag:
         CMD.append("--no_cleanup")
 
-    CMD.append(case_path)
+    if gc_flag:
+        CMD.append("--gc")
+
+    if memory64_flag:
+        CMD.append("--memory64")
+
+    if multi_memory_flag:
+        CMD.append("--multi-memory")
+
+    if log != "":
+        CMD.append("--log-dir")
+        CMD.append(log)
+
+    case_path = pathlib.Path(case_path).resolve()
+    case_name = case_path.stem
+
+    CMD.append(str(case_path))
+    # print(f"============> use {' '.join(CMD)}")
     print(f"============> run {case_name} ", end="")
     with subprocess.Popen(
         CMD,
@@ -190,7 +256,7 @@ def test_case(
                 if verbose_flag:
                     print(output, end="")
                 else:
-                    if len(case_last_words) == 16:
+                    if len(case_last_words) == 1024:
                         case_last_words.pop(0)
                     case_last_words.append(output)
 
@@ -219,16 +285,23 @@ def test_case(
 def test_suite(
     target,
     aot_flag=False,
+    aot_compiler=WAMRC_CMD,
     sgx_flag=False,
     multi_module_flag=False,
     multi_thread_flag=False,
     simd_flag=False,
     xip_flag=False,
+    eh_flag=False,
     clean_up_flag=True,
     verbose_flag=True,
+    gc_flag=False,
+    memory64_flag=False,
+    multi_memory_flag=False,
     parl_flag=False,
     qemu_flag=False,
-    qemu_firmware=''
+    qemu_firmware="",
+    log="",
+    no_pty=False,
 ):
     suite_path = pathlib.Path(SPEC_TEST_DIR).resolve()
     if not suite_path.exists():
@@ -239,6 +312,44 @@ def test_suite(
     if simd_flag:
         simd_case_list = sorted(suite_path.glob("simd/*.wast"))
         case_list.extend(simd_case_list)
+
+    if gc_flag:
+        gc_case_list = sorted(suite_path.glob("gc/*.wast"))
+        case_list.extend(gc_case_list)
+
+    if eh_flag:
+        eh_case_list = sorted(suite_path.glob("*.wast"))
+        eh_case_list_include = [test for test in eh_case_list if test.stem in ["throw", "tag", "try_catch", "rethrow", "try_delegate"]]
+        case_list.extend(eh_case_list_include)
+
+    if multi_memory_flag:
+        multi_memory_list = sorted(suite_path.glob("multi-memory/*.wast"))
+        case_list.extend(multi_memory_list)
+
+    # ignore based on command line options
+    filtered_case_list = []
+    for case_path in case_list:
+        case_name = case_path.stem
+        if not ignore_the_case(
+            case_name,
+            target,
+            aot_flag,
+            sgx_flag,
+            multi_module_flag,
+            multi_thread_flag,
+            simd_flag,
+            gc_flag,
+            memory64_flag,
+            multi_memory_flag,
+            xip_flag,
+            eh_flag,
+            qemu_flag,
+        ):
+            filtered_case_list.append(case_path)
+        else:
+            print(f"---> skip {case_name}")
+    print(f"---> {len(case_list)} ---filter--> {len(filtered_case_list)}")
+    case_list = filtered_case_list
 
     case_count = len(case_list)
     failed_case = 0
@@ -255,15 +366,22 @@ def test_suite(
                         str(case_path),
                         target,
                         aot_flag,
+                        aot_compiler,
                         sgx_flag,
                         multi_module_flag,
                         multi_thread_flag,
                         simd_flag,
                         xip_flag,
+                        eh_flag,
                         clean_up_flag,
                         verbose_flag,
+                        gc_flag,
+                        memory64_flag,
+                        multi_memory_flag,
                         qemu_flag,
                         qemu_firmware,
+                        log,
+                        no_pty,
                     ],
                 )
 
@@ -285,20 +403,28 @@ def test_suite(
     else:
         print(f"----- Run the whole spec test suite -----")
         for case_path in case_list:
+            print(case_path)
             try:
                 test_case(
                     str(case_path),
                     target,
                     aot_flag,
+                    aot_compiler,
                     sgx_flag,
                     multi_module_flag,
                     multi_thread_flag,
                     simd_flag,
                     xip_flag,
+                    eh_flag,
                     clean_up_flag,
                     verbose_flag,
+                    gc_flag,
+                    memory64_flag,
+                    multi_memory_flag,
                     qemu_flag,
                     qemu_firmware,
+                    log,
+                    no_pty,
                 )
                 successful_case += 1
             except Exception as e:
@@ -324,8 +450,7 @@ def main():
     )
     parser.add_argument(
         "-m",
-        action=TargetAction,
-        choices=list(TargetAction.TARGET_MAP.keys()),
+        choices=AVAILABLE_TARGETS,
         type=str,
         dest="target",
         default="X86_64",
@@ -352,12 +477,26 @@ def main():
         dest="xip_flag",
         help="Running with the XIP feature",
     )
+    # added to support WASM_ENABLE_EXCE_HANDLING
+    parser.add_argument(
+        "-e",
+        action="store_true",
+        default=False,
+        dest="eh_flag",
+        help="Running with the exception-handling feature",
+    )
     parser.add_argument(
         "-t",
         action="store_true",
         default=False,
         dest="aot_flag",
         help="Running with AOT mode",
+    )
+    parser.add_argument(
+        "--aot-compiler",
+        default=WAMRC_CMD,
+        dest="aot_compiler",
+        help="AOT compiler",
     )
     parser.add_argument(
         "-x",
@@ -394,11 +533,38 @@ def main():
         help="Firmware required by qemu",
     )
     parser.add_argument(
+        "--log",
+        default="",
+        dest="log",
+        help="Log directory",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_false",
         default=True,
         dest="verbose_flag",
         help="Close real time output while running cases, only show last words of failed ones",
+    )
+    parser.add_argument(
+        "--gc",
+        action="store_true",
+        default=False,
+        dest="gc_flag",
+        help="Running with GC feature",
+    )
+    parser.add_argument(
+        "--memory64",
+        action="store_true",
+        default=False,
+        dest="memory64_flag",
+        help="Running with memory64 feature",
+    )
+    parser.add_argument(
+        "--multi-memory",
+        action="store_true",
+        default=False,
+        dest="multi_memory_flag",
+        help="Running with multi-memory feature",
     )
     parser.add_argument(
         "cases",
@@ -407,34 +573,50 @@ def main():
         nargs="*",
         help=f"Specify all wanted cases. If not the script will go through all cases under {SPEC_TEST_DIR}",
     )
+    parser.add_argument('--no-pty', action='store_true',
+        help="Use direct pipes instead of pseudo-tty")
 
     options = parser.parse_args()
-    print(options)
 
-    if not preflight_check(options.aot_flag):
+    # Convert target to lower case for internal use, e.g. X86_64 -> x86_64
+    # target is always exist, so no need to check it
+    options.target = options.target.lower()
+
+    if options.target == "x86_32":
+        options.target = "i386"
+
+    if not preflight_check(options.aot_flag, options.aot_compiler, options.eh_flag):
         return False
 
     if not options.cases:
         if options.parl_flag:
             # several cases might share the same workspace/tempfile at the same time
             # so, disable it while running parallelly
-            options.clean_up_flag = False
+            if options.multi_module_flag:
+                options.clean_up_flag = False
             options.verbose_flag = False
 
         start = time.time_ns()
         ret = test_suite(
             options.target,
             options.aot_flag,
+            options.aot_compiler,
             options.sgx_flag,
             options.multi_module_flag,
             options.multi_thread_flag,
             options.simd_flag,
             options.xip_flag,
+            options.eh_flag,
             options.clean_up_flag,
             options.verbose_flag,
+            options.gc_flag,
+            options.memory64_flag,
+            options.multi_memory_flag,
             options.parl_flag,
             options.qemu_flag,
             options.qemu_firmware,
+            options.log,
+            options.no_pty
         )
         end = time.time_ns()
         print(
@@ -447,15 +629,22 @@ def main():
                     case,
                     options.target,
                     options.aot_flag,
+                    options.aot_compiler,
                     options.sgx_flag,
                     options.multi_module_flag,
                     options.multi_thread_flag,
                     options.simd_flag,
                     options.xip_flag,
+                    options.eh_flag,
                     options.clean_up_flag,
                     options.verbose_flag,
+                    options.gc_flag,
+                    options.memory64_flag,
+                    options.multi_memory_flag,
                     options.qemu_flag,
-                    options.qemu_firmware
+                    options.qemu_firmware,
+                    options.log,
+                    options.no_pty,
                 )
             else:
                 ret = True
