@@ -76,11 +76,12 @@ jit_frontend_get_table_inst_offset(const WASMModule *module, uint32 tbl_idx)
 
         offset += (uint32)offsetof(WASMTableInstance, elems);
 #if WASM_ENABLE_MULTI_MODULE != 0
-        offset += (uint32)sizeof(uint32) * import_table->max_size;
+        offset += (uint32)sizeof(uint32) * import_table->table_type.max_size;
 #else
         offset += (uint32)sizeof(uint32)
-                  * (import_table->possible_grow ? import_table->max_size
-                                                 : import_table->init_size);
+                  * (import_table->table_type.possible_grow
+                         ? import_table->table_type.max_size
+                         : import_table->table_type.init_size);
 #endif
 
         i++;
@@ -97,10 +98,13 @@ jit_frontend_get_table_inst_offset(const WASMModule *module, uint32 tbl_idx)
 
         offset += (uint32)offsetof(WASMTableInstance, elems);
 #if WASM_ENABLE_MULTI_MODULE != 0
-        offset += (uint32)sizeof(uint32) * table->max_size;
+        offset +=
+            (uint32)sizeof(table_elem_type_t) * table->table_type.max_size;
 #else
-        offset += (uint32)sizeof(uint32)
-                  * (table->possible_grow ? table->max_size : table->init_size);
+        offset +=
+            (uint32)sizeof(table_elem_type_t)
+            * (table->table_type.possible_grow ? table->table_type.max_size
+                                               : table->table_type.init_size);
 #endif
 
         i++;
@@ -194,12 +198,15 @@ JitReg
 get_aux_stack_bound_reg(JitFrame *frame)
 {
     JitCompContext *cc = frame->cc;
+    JitReg tmp = jit_cc_new_reg_I32(cc);
 
     if (!frame->aux_stack_bound_reg) {
         frame->aux_stack_bound_reg = cc->aux_stack_bound_reg;
-        GEN_INSN(
-            LDI32, frame->aux_stack_bound_reg, cc->exec_env_reg,
-            NEW_CONST(I32, offsetof(WASMExecEnv, aux_stack_boundary.boundary)));
+        GEN_INSN(LDPTR, frame->aux_stack_bound_reg, cc->exec_env_reg,
+                 NEW_CONST(I32, offsetof(WASMExecEnv, aux_stack_boundary)));
+        /* TODO: Memory64 whether to convert depends on memory idx type */
+        GEN_INSN(I64TOI32, tmp, frame->aux_stack_bound_reg);
+        frame->aux_stack_bound_reg = tmp;
     }
     return frame->aux_stack_bound_reg;
 }
@@ -208,30 +215,159 @@ JitReg
 get_aux_stack_bottom_reg(JitFrame *frame)
 {
     JitCompContext *cc = frame->cc;
+    JitReg tmp = jit_cc_new_reg_I32(cc);
 
     if (!frame->aux_stack_bottom_reg) {
         frame->aux_stack_bottom_reg = cc->aux_stack_bottom_reg;
-        GEN_INSN(
-            LDI32, frame->aux_stack_bottom_reg, cc->exec_env_reg,
-            NEW_CONST(I32, offsetof(WASMExecEnv, aux_stack_bottom.bottom)));
+        GEN_INSN(LDPTR, frame->aux_stack_bottom_reg, cc->exec_env_reg,
+                 NEW_CONST(I32, offsetof(WASMExecEnv, aux_stack_bottom)));
+        /* TODO: Memory64 whether to convert depends on memory idx type */
+        GEN_INSN(I64TOI32, tmp, frame->aux_stack_bottom_reg);
+        frame->aux_stack_bottom_reg = tmp;
     }
     return frame->aux_stack_bottom_reg;
+}
+
+#if WASM_ENABLE_SHARED_MEMORY != 0
+static bool
+is_shared_memory(WASMModule *module, uint32 mem_idx)
+{
+    WASMMemory *memory;
+    WASMMemoryImport *memory_import;
+    bool is_shared;
+
+    if (mem_idx < module->import_memory_count) {
+        memory_import = &(module->import_memories[mem_idx].u.memory);
+        is_shared = memory_import->mem_type.flags & 0x02 ? true : false;
+    }
+    else {
+        memory = &module->memories[mem_idx - module->import_memory_count];
+        is_shared = memory->flags & 0x02 ? true : false;
+    }
+    return is_shared;
+}
+#endif
+
+JitReg
+get_memory_inst_reg(JitFrame *frame, uint32 mem_idx)
+{
+    JitCompContext *cc = frame->cc;
+    JitReg module_inst_reg = get_module_inst_reg(frame);
+    uint32 memory_inst_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memories_addr;
+    uint32 memories_offset;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].memory_inst)
+        return frame->memory_regs[mem_idx].memory_inst;
+
+    frame->memory_regs[mem_idx].memory_inst =
+        cc->memory_regs[mem_idx].memory_inst;
+
+    bh_assert(mem_idx == 0);
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memories_addr = jit_cc_new_reg_ptr(cc);
+        memories_offset = (uint32)offsetof(WASMModuleInstance, memories);
+        /* module_inst->memories */
+        GEN_INSN(LDPTR, memories_addr, module_inst_reg,
+                 NEW_CONST(I32, memories_offset));
+        /* module_inst->memories[mem_idx], mem_idx can only be 0 now */
+        GEN_INSN(LDPTR, frame->memory_regs[mem_idx].memory_inst, memories_addr,
+                 NEW_CONST(I32, mem_idx));
+    }
+    else
+#endif
+    {
+        memory_inst_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes);
+        GEN_INSN(LDPTR, frame->memory_regs[mem_idx].memory_inst,
+                 module_inst_reg, NEW_CONST(I32, memory_inst_offset));
+    }
+
+    return frame->memory_regs[mem_idx].memory_inst;
+}
+
+JitReg
+get_cur_page_count_reg(JitFrame *frame, uint32 mem_idx)
+{
+    JitCompContext *cc = frame->cc;
+    JitReg module_inst_reg;
+    uint32 cur_page_count_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memory_inst_reg;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].cur_page_count)
+        return frame->memory_regs[mem_idx].cur_page_count;
+
+    frame->memory_regs[mem_idx].cur_page_count =
+        cc->memory_regs[mem_idx].cur_page_count;
+
+    /* Get current page count */
+    bh_assert(mem_idx == 0);
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memory_inst_reg = get_memory_inst_reg(frame, mem_idx);
+        cur_page_count_offset =
+            (uint32)offsetof(WASMMemoryInstance, cur_page_count);
+        /* memories[mem_idx]->cur_page_count_offset */
+        GEN_INSN(LDI32, frame->memory_regs[mem_idx].cur_page_count,
+                 memory_inst_reg, NEW_CONST(I32, cur_page_count_offset));
+    }
+    else
+#endif
+    {
+        module_inst_reg = get_module_inst_reg(frame);
+        cur_page_count_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
+            + (uint32)offsetof(WASMMemoryInstance, cur_page_count);
+        GEN_INSN(LDI32, frame->memory_regs[mem_idx].cur_page_count,
+                 module_inst_reg, NEW_CONST(I32, cur_page_count_offset));
+    }
+
+    return frame->memory_regs[mem_idx].cur_page_count;
 }
 
 JitReg
 get_memory_data_reg(JitFrame *frame, uint32 mem_idx)
 {
     JitCompContext *cc = frame->cc;
-    JitReg module_inst_reg = get_module_inst_reg(frame);
-    uint32 memory_data_offset =
-        (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
-        + (uint32)offsetof(WASMMemoryInstance, memory_data);
+    JitReg module_inst_reg;
+    uint32 memory_data_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memory_inst_reg;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].memory_data)
+        return frame->memory_regs[mem_idx].memory_data;
+
+    frame->memory_regs[mem_idx].memory_data =
+        cc->memory_regs[mem_idx].memory_data;
 
     bh_assert(mem_idx == 0);
-
-    if (!frame->memory_regs[mem_idx].memory_data) {
-        frame->memory_regs[mem_idx].memory_data =
-            cc->memory_regs[mem_idx].memory_data;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memory_inst_reg = get_memory_inst_reg(frame, mem_idx);
+        memory_data_offset = (uint32)offsetof(WASMMemoryInstance, memory_data);
+        /* memories[mem_idx]->memory_data */
+        GEN_INSN(LDPTR, frame->memory_regs[mem_idx].memory_data,
+                 memory_inst_reg, NEW_CONST(I32, memory_data_offset));
+    }
+    else
+#endif
+    {
+        module_inst_reg = get_module_inst_reg(frame);
+        memory_data_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
+            + (uint32)offsetof(WASMMemoryInstance, memory_data);
         GEN_INSN(LDPTR, frame->memory_regs[mem_idx].memory_data,
                  module_inst_reg, NEW_CONST(I32, memory_data_offset));
     }
@@ -242,16 +378,37 @@ JitReg
 get_memory_data_end_reg(JitFrame *frame, uint32 mem_idx)
 {
     JitCompContext *cc = frame->cc;
-    JitReg module_inst_reg = get_module_inst_reg(frame);
-    uint32 memory_data_end_offset =
-        (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
-        + (uint32)offsetof(WASMMemoryInstance, memory_data_end);
+    JitReg module_inst_reg;
+    uint32 memory_data_end_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memory_inst_reg;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].memory_data_end)
+        return frame->memory_regs[mem_idx].memory_data_end;
+
+    frame->memory_regs[mem_idx].memory_data_end =
+        cc->memory_regs[mem_idx].memory_data_end;
 
     bh_assert(mem_idx == 0);
-
-    if (!frame->memory_regs[mem_idx].memory_data_end) {
-        frame->memory_regs[mem_idx].memory_data_end =
-            cc->memory_regs[mem_idx].memory_data_end;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memory_inst_reg = get_memory_inst_reg(frame, mem_idx);
+        memory_data_end_offset =
+            (uint32)offsetof(WASMMemoryInstance, memory_data_end);
+        /* memories[mem_idx]->memory_data_end */
+        GEN_INSN(LDPTR, frame->memory_regs[mem_idx].memory_data_end,
+                 memory_inst_reg, NEW_CONST(I32, memory_data_end_offset));
+    }
+    else
+#endif
+    {
+        module_inst_reg = get_module_inst_reg(frame);
+        memory_data_end_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
+            + (uint32)offsetof(WASMMemoryInstance, memory_data_end);
         GEN_INSN(LDPTR, frame->memory_regs[mem_idx].memory_data_end,
                  module_inst_reg, NEW_CONST(I32, memory_data_end_offset));
     }
@@ -262,16 +419,43 @@ JitReg
 get_mem_bound_check_1byte_reg(JitFrame *frame, uint32 mem_idx)
 {
     JitCompContext *cc = frame->cc;
-    JitReg module_inst_reg = get_module_inst_reg(frame);
-    uint32 mem_bound_check_1byte_offset =
-        (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
-        + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_1byte);
+    JitReg module_inst_reg;
+    uint32 mem_bound_check_1byte_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memory_inst_reg;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].mem_bound_check_1byte)
+        return frame->memory_regs[mem_idx].mem_bound_check_1byte;
+
+    frame->memory_regs[mem_idx].mem_bound_check_1byte =
+        cc->memory_regs[mem_idx].mem_bound_check_1byte;
 
     bh_assert(mem_idx == 0);
 
-    if (!frame->memory_regs[mem_idx].mem_bound_check_1byte) {
-        frame->memory_regs[mem_idx].mem_bound_check_1byte =
-            cc->memory_regs[mem_idx].mem_bound_check_1byte;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memory_inst_reg = get_memory_inst_reg(frame, mem_idx);
+        mem_bound_check_1byte_offset =
+            (uint32)offsetof(WASMMemoryInstance, mem_bound_check_1byte);
+        /* memories[mem_idx]->mem_bound_check_1byte */
+#if UINTPTR_MAX == UINT64_MAX
+        GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_1byte,
+                 memory_inst_reg, NEW_CONST(I32, mem_bound_check_1byte_offset));
+#else
+        GEN_INSN(LDI32, frame->memory_regs[mem_idx].mem_bound_check_1byte,
+                 memory_inst_reg, NEW_CONST(I32, mem_bound_check_1byte_offset));
+#endif
+    }
+    else
+#endif
+    {
+        module_inst_reg = get_module_inst_reg(frame);
+        mem_bound_check_1byte_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
+            + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_1byte);
 #if UINTPTR_MAX == UINT64_MAX
         GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_1byte,
                  module_inst_reg, NEW_CONST(I32, mem_bound_check_1byte_offset));
@@ -287,16 +471,45 @@ JitReg
 get_mem_bound_check_2bytes_reg(JitFrame *frame, uint32 mem_idx)
 {
     JitCompContext *cc = frame->cc;
-    JitReg module_inst_reg = get_module_inst_reg(frame);
-    uint32 mem_bound_check_2bytes_offset =
-        (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
-        + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_2bytes);
+    JitReg module_inst_reg;
+    uint32 mem_bound_check_2bytes_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memory_inst_reg;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].mem_bound_check_2bytes)
+        return frame->memory_regs[mem_idx].mem_bound_check_2bytes;
+
+    frame->memory_regs[mem_idx].mem_bound_check_2bytes =
+        cc->memory_regs[mem_idx].mem_bound_check_2bytes;
 
     bh_assert(mem_idx == 0);
 
-    if (!frame->memory_regs[mem_idx].mem_bound_check_2bytes) {
-        frame->memory_regs[mem_idx].mem_bound_check_2bytes =
-            cc->memory_regs[mem_idx].mem_bound_check_2bytes;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memory_inst_reg = get_memory_inst_reg(frame, mem_idx);
+        mem_bound_check_2bytes_offset =
+            (uint32)offsetof(WASMMemoryInstance, mem_bound_check_2bytes);
+        /* memories[mem_idx]->mem_bound_check_2bytes */
+#if UINTPTR_MAX == UINT64_MAX
+        GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_2bytes,
+                 memory_inst_reg,
+                 NEW_CONST(I32, mem_bound_check_2bytes_offset));
+#else
+        GEN_INSN(LDI32, frame->memory_regs[mem_idx].mem_bound_check_2bytes,
+                 memory_inst_reg,
+                 NEW_CONST(I32, mem_bound_check_2bytes_offset));
+#endif
+    }
+    else
+#endif
+    {
+        module_inst_reg = get_module_inst_reg(frame);
+        mem_bound_check_2bytes_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
+            + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_2bytes);
 #if UINTPTR_MAX == UINT64_MAX
         GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_2bytes,
                  module_inst_reg,
@@ -314,16 +527,45 @@ JitReg
 get_mem_bound_check_4bytes_reg(JitFrame *frame, uint32 mem_idx)
 {
     JitCompContext *cc = frame->cc;
-    JitReg module_inst_reg = get_module_inst_reg(frame);
-    uint32 mem_bound_check_4bytes_offset =
-        (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
-        + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_4bytes);
+    JitReg module_inst_reg;
+    uint32 mem_bound_check_4bytes_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memory_inst_reg;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].mem_bound_check_4bytes)
+        return frame->memory_regs[mem_idx].mem_bound_check_4bytes;
+
+    frame->memory_regs[mem_idx].mem_bound_check_4bytes =
+        cc->memory_regs[mem_idx].mem_bound_check_4bytes;
 
     bh_assert(mem_idx == 0);
 
-    if (!frame->memory_regs[mem_idx].mem_bound_check_4bytes) {
-        frame->memory_regs[mem_idx].mem_bound_check_4bytes =
-            cc->memory_regs[mem_idx].mem_bound_check_4bytes;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memory_inst_reg = get_memory_inst_reg(frame, mem_idx);
+        mem_bound_check_4bytes_offset =
+            (uint32)offsetof(WASMMemoryInstance, mem_bound_check_4bytes);
+        /* memories[mem_idx]->mem_bound_check_4bytes */
+#if UINTPTR_MAX == UINT64_MAX
+        GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_4bytes,
+                 memory_inst_reg,
+                 NEW_CONST(I32, mem_bound_check_4bytes_offset));
+#else
+        GEN_INSN(LDI32, frame->memory_regs[mem_idx].mem_bound_check_4bytes,
+                 memory_inst_reg,
+                 NEW_CONST(I32, mem_bound_check_4bytes_offset));
+#endif
+    }
+    else
+#endif
+    {
+        module_inst_reg = get_module_inst_reg(frame);
+        mem_bound_check_4bytes_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
+            + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_4bytes);
 #if UINTPTR_MAX == UINT64_MAX
         GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_4bytes,
                  module_inst_reg,
@@ -341,16 +583,45 @@ JitReg
 get_mem_bound_check_8bytes_reg(JitFrame *frame, uint32 mem_idx)
 {
     JitCompContext *cc = frame->cc;
-    JitReg module_inst_reg = get_module_inst_reg(frame);
-    uint32 mem_bound_check_8bytes_offset =
-        (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
-        + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_8bytes);
+    JitReg module_inst_reg;
+    uint32 mem_bound_check_8bytes_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memory_inst_reg;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].mem_bound_check_8bytes)
+        return frame->memory_regs[mem_idx].mem_bound_check_8bytes;
+
+    frame->memory_regs[mem_idx].mem_bound_check_8bytes =
+        cc->memory_regs[mem_idx].mem_bound_check_8bytes;
 
     bh_assert(mem_idx == 0);
 
-    if (!frame->memory_regs[mem_idx].mem_bound_check_8bytes) {
-        frame->memory_regs[mem_idx].mem_bound_check_8bytes =
-            cc->memory_regs[mem_idx].mem_bound_check_8bytes;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memory_inst_reg = get_memory_inst_reg(frame, mem_idx);
+        mem_bound_check_8bytes_offset =
+            (uint32)offsetof(WASMMemoryInstance, mem_bound_check_8bytes);
+        /* memories[mem_idx]->mem_bound_check_8bytes */
+#if UINTPTR_MAX == UINT64_MAX
+        GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_8bytes,
+                 memory_inst_reg,
+                 NEW_CONST(I32, mem_bound_check_8bytes_offset));
+#else
+        GEN_INSN(LDI32, frame->memory_regs[mem_idx].mem_bound_check_8bytes,
+                 memory_inst_reg,
+                 NEW_CONST(I32, mem_bound_check_8bytes_offset));
+#endif
+    }
+    else
+#endif
+    {
+        module_inst_reg = get_module_inst_reg(frame);
+        mem_bound_check_8bytes_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
+            + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_8bytes);
 #if UINTPTR_MAX == UINT64_MAX
         GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_8bytes,
                  module_inst_reg,
@@ -368,16 +639,45 @@ JitReg
 get_mem_bound_check_16bytes_reg(JitFrame *frame, uint32 mem_idx)
 {
     JitCompContext *cc = frame->cc;
-    JitReg module_inst_reg = get_module_inst_reg(frame);
-    uint32 mem_bound_check_16bytes_offset =
-        (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
-        + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_16bytes);
+    JitReg module_inst_reg;
+    uint32 mem_bound_check_16bytes_offset;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    JitReg memory_inst_reg;
+    bool is_shared;
+#endif
+
+    if (frame->memory_regs[mem_idx].mem_bound_check_16bytes)
+        return frame->memory_regs[mem_idx].mem_bound_check_16bytes;
+
+    frame->memory_regs[mem_idx].mem_bound_check_16bytes =
+        cc->memory_regs[mem_idx].mem_bound_check_16bytes;
 
     bh_assert(mem_idx == 0);
 
-    if (!frame->memory_regs[mem_idx].mem_bound_check_16bytes) {
-        frame->memory_regs[mem_idx].mem_bound_check_16bytes =
-            cc->memory_regs[mem_idx].mem_bound_check_16bytes;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    is_shared = is_shared_memory(cc->cur_wasm_module, mem_idx);
+    if (is_shared) {
+        memory_inst_reg = get_memory_inst_reg(frame, mem_idx);
+        mem_bound_check_16bytes_offset =
+            (uint32)offsetof(WASMMemoryInstance, mem_bound_check_16bytes);
+        /* memories[mem_idx]->mem_bound_check_16bytes */
+#if UINTPTR_MAX == UINT64_MAX
+        GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_16bytes,
+                 memory_inst_reg,
+                 NEW_CONST(I32, mem_bound_check_16bytes_offset));
+#else
+        GEN_INSN(LDI32, frame->memory_regs[mem_idx].mem_bound_check_16bytes,
+                 memory_inst_reg,
+                 NEW_CONST(I32, mem_bound_check_16bytes_offset));
+#endif
+    }
+    else
+#endif
+    {
+        module_inst_reg = get_module_inst_reg(frame);
+        mem_bound_check_16bytes_offset =
+            (uint32)offsetof(WASMModuleInstance, global_table_data.bytes)
+            + (uint32)offsetof(WASMMemoryInstance, mem_bound_check_16bytes);
 #if UINTPTR_MAX == UINT64_MAX
         GEN_INSN(LDI64, frame->memory_regs[mem_idx].mem_bound_check_16bytes,
                  module_inst_reg,
@@ -443,6 +743,8 @@ clear_fixed_virtual_regs(JitFrame *frame)
 
     count = module->import_memory_count + module->memory_count;
     for (i = 0; i < count; i++) {
+        frame->memory_regs[i].memory_inst = 0;
+        frame->memory_regs[i].cur_page_count = 0;
         frame->memory_regs[i].memory_data = 0;
         frame->memory_regs[i].memory_data_end = 0;
         frame->memory_regs[i].mem_bound_check_1byte = 0;
@@ -467,6 +769,7 @@ clear_memory_regs(JitFrame *frame)
 
     count = module->import_memory_count + module->memory_count;
     for (i = 0; i < count; i++) {
+        frame->memory_regs[i].cur_page_count = 0;
         frame->memory_regs[i].memory_data = 0;
         frame->memory_regs[i].memory_data_end = 0;
         frame->memory_regs[i].mem_bound_check_1byte = 0;
@@ -622,8 +925,8 @@ create_fixed_virtual_regs(JitCompContext *cc)
     cc->import_func_ptrs_reg = jit_cc_new_reg_ptr(cc);
     cc->fast_jit_func_ptrs_reg = jit_cc_new_reg_ptr(cc);
     cc->func_type_indexes_reg = jit_cc_new_reg_ptr(cc);
-    cc->aux_stack_bound_reg = jit_cc_new_reg_I32(cc);
-    cc->aux_stack_bottom_reg = jit_cc_new_reg_I32(cc);
+    cc->aux_stack_bound_reg = jit_cc_new_reg_ptr(cc);
+    cc->aux_stack_bottom_reg = jit_cc_new_reg_ptr(cc);
 
     count = module->import_memory_count + module->memory_count;
     if (count > 0) {
@@ -635,6 +938,8 @@ create_fixed_virtual_regs(JitCompContext *cc)
         }
 
         for (i = 0; i < count; i++) {
+            cc->memory_regs[i].memory_inst = jit_cc_new_reg_ptr(cc);
+            cc->memory_regs[i].cur_page_count = jit_cc_new_reg_I32(cc);
             cc->memory_regs[i].memory_data = jit_cc_new_reg_ptr(cc);
             cc->memory_regs[i].memory_data_end = jit_cc_new_reg_ptr(cc);
             cc->memory_regs[i].mem_bound_check_1byte = jit_cc_new_reg_ptr(cc);
@@ -798,7 +1103,7 @@ init_func_translation(JitCompContext *cc)
         || !(jit_frame = jit_calloc(offsetof(JitFrame, lp)
                                     + sizeof(*jit_frame->lp)
                                           * (max_locals + max_stacks)))) {
-        os_printf("allocate jit frame failed\n");
+        LOG_ERROR("allocate jit frame failed\n");
         return NULL;
     }
 
@@ -841,7 +1146,7 @@ init_func_translation(JitCompContext *cc)
     cc->spill_cache_offset = wasm_interp_interp_frame_size(total_cell_num);
     /* Set spill cache size according to max local cell num, max stack cell
        num and virtual fixed register num */
-    cc->spill_cache_size = (max_locals + max_stacks) * 4 + sizeof(void *) * 5;
+    cc->spill_cache_size = (max_locals + max_stacks) * 4 + sizeof(void *) * 16;
     cc->total_frame_size = cc->spill_cache_offset + cc->spill_cache_size;
     cc->jitted_return_address_offset =
         offsetof(WASMInterpFrame, jitted_return_addr);
@@ -862,22 +1167,22 @@ init_func_translation(JitCompContext *cc)
     func_inst = jit_cc_new_reg_ptr(cc);
 #if WASM_ENABLE_PERF_PROFILING != 0
     time_started = jit_cc_new_reg_I64(cc);
-    /* Call os_time_get_boot_microsecond() to get time_started firstly
+    /* Call os_time_thread_cputime_us() to get time_started firstly
        as there is stack frame switching below, calling native in them
        may cause register spilling work inproperly */
-    if (!jit_emit_callnative(cc, os_time_get_boot_microsecond, time_started,
-                             NULL, 0)) {
+    if (!jit_emit_callnative(cc, os_time_thread_cputime_us, time_started, NULL,
+                             0)) {
         return NULL;
     }
 #endif
 #endif
 
-    /* top = exec_env->wasm_stack.s.top */
+    /* top = exec_env->wasm_stack.top */
     GEN_INSN(LDPTR, top, cc->exec_env_reg,
-             NEW_CONST(I32, offsetof(WASMExecEnv, wasm_stack.s.top)));
-    /* top_boundary = exec_env->wasm_stack.s.top_boundary */
+             NEW_CONST(I32, offsetof(WASMExecEnv, wasm_stack.top)));
+    /* top_boundary = exec_env->wasm_stack.top_boundary */
     GEN_INSN(LDPTR, top_boundary, cc->exec_env_reg,
-             NEW_CONST(I32, offsetof(WASMExecEnv, wasm_stack.s.top_boundary)));
+             NEW_CONST(I32, offsetof(WASMExecEnv, wasm_stack.top_boundary)));
     /* frame_boundary = top + frame_size + outs_size */
     GEN_INSN(ADD, frame_boundary, top, NEW_CONST(PTR, frame_size + outs_size));
     /* if frame_boundary > top_boundary, throw stack overflow exception */
@@ -890,9 +1195,9 @@ init_func_translation(JitCompContext *cc)
     /* Add first and then sub to reduce one used register */
     /* new_top = frame_boundary - outs_size = top + frame_size */
     GEN_INSN(SUB, new_top, frame_boundary, NEW_CONST(PTR, outs_size));
-    /* exec_env->wasm_stack.s.top = new_top */
+    /* exec_env->wasm_stack.top = new_top */
     GEN_INSN(STPTR, new_top, cc->exec_env_reg,
-             NEW_CONST(I32, offsetof(WASMExecEnv, wasm_stack.s.top)));
+             NEW_CONST(I32, offsetof(WASMExecEnv, wasm_stack.top)));
     /* frame_sp = frame->lp + local_size */
     GEN_INSN(ADD, frame_sp, top,
              NEW_CONST(PTR, offsetof(WASMInterpFrame, lp) + local_size));
@@ -941,6 +1246,21 @@ init_func_translation(JitCompContext *cc)
         GEN_INSN(STI32, NEW_CONST(I32, 0), cc->fp_reg,
                  NEW_CONST(I32, local_off));
     }
+
+#if WASM_ENABLE_REF_TYPES != 0 && WASM_ENABLE_GC == 0
+    /* externref/funcref should be NULL_REF rather than 0 */
+    local_off = (uint32)offsetof(WASMInterpFrame, lp)
+                + cur_wasm_func->param_cell_num * 4;
+    for (i = 0; i < cur_wasm_func->local_count; i++) {
+        if (cur_wasm_func->local_types[i] == VALUE_TYPE_EXTERNREF
+            || cur_wasm_func->local_types[i] == VALUE_TYPE_FUNCREF) {
+            GEN_INSN(STI32, NEW_CONST(I32, NULL_REF), cc->fp_reg,
+                     NEW_CONST(I32, local_off));
+        }
+        local_off +=
+            4 * wasm_value_type_cell_num(cur_wasm_func->local_types[i]);
+    }
+#endif
 
     return jit_frame;
 }
@@ -1078,6 +1398,39 @@ read_leb(JitCompContext *cc, const uint8 *buf, const uint8 *buf_end,
         res = (int64)res64;                                  \
     } while (0)
 
+#if WASM_ENABLE_SHARED_MEMORY != 0
+#define COMPILE_ATOMIC_RMW(OP, NAME)                  \
+    case WASM_OP_ATOMIC_RMW_I32_##NAME:               \
+        bytes = 4;                                    \
+        op_type = VALUE_TYPE_I32;                     \
+        goto OP_ATOMIC_##OP;                          \
+    case WASM_OP_ATOMIC_RMW_I64_##NAME:               \
+        bytes = 8;                                    \
+        op_type = VALUE_TYPE_I64;                     \
+        goto OP_ATOMIC_##OP;                          \
+    case WASM_OP_ATOMIC_RMW_I32_##NAME##8_U:          \
+        bytes = 1;                                    \
+        op_type = VALUE_TYPE_I32;                     \
+        goto OP_ATOMIC_##OP;                          \
+    case WASM_OP_ATOMIC_RMW_I32_##NAME##16_U:         \
+        bytes = 2;                                    \
+        op_type = VALUE_TYPE_I32;                     \
+        goto OP_ATOMIC_##OP;                          \
+    case WASM_OP_ATOMIC_RMW_I64_##NAME##8_U:          \
+        bytes = 1;                                    \
+        op_type = VALUE_TYPE_I64;                     \
+        goto OP_ATOMIC_##OP;                          \
+    case WASM_OP_ATOMIC_RMW_I64_##NAME##16_U:         \
+        bytes = 2;                                    \
+        op_type = VALUE_TYPE_I64;                     \
+        goto OP_ATOMIC_##OP;                          \
+    case WASM_OP_ATOMIC_RMW_I64_##NAME##32_U:         \
+        bytes = 4;                                    \
+        op_type = VALUE_TYPE_I64;                     \
+        OP_ATOMIC_##OP : bin_op = AtomicRMWBinOp##OP; \
+        goto build_atomic_rmw;
+#endif
+
 static bool
 jit_compile_func(JitCompContext *cc)
 {
@@ -1161,7 +1514,9 @@ jit_compile_func(JitCompContext *cc)
             case EXT_OP_LOOP:
             case EXT_OP_IF:
             {
-                read_leb_uint32(frame_ip, frame_ip_end, type_idx);
+                read_leb_int32(frame_ip, frame_ip_end, type_idx);
+                /* type index was checked in wasm loader */
+                bh_assert(type_idx < cc->cur_wasm_module->type_count);
                 func_type = cc->cur_wasm_module->types[type_idx];
                 param_count = func_type->param_count;
                 param_types = func_type->types;
@@ -1930,7 +2285,9 @@ jit_compile_func(JitCompContext *cc)
                 uint32 opcode1;
 
                 read_leb_uint32(frame_ip, frame_ip_end, opcode1);
-                opcode = (uint32)opcode1;
+                /* opcode1 was checked in loader and is no larger than
+                   UINT8_MAX */
+                opcode = (uint8)opcode1;
 
                 switch (opcode) {
                     case WASM_OP_I32_TRUNC_SAT_S_F32:
@@ -2069,10 +2426,13 @@ jit_compile_func(JitCompContext *cc)
             case WASM_OP_ATOMIC_PREFIX:
             {
                 uint8 bin_op, op_type;
+                uint32 opcode1;
 
-                if (frame_ip < frame_ip_end) {
-                    opcode = *frame_ip++;
-                }
+                read_leb_uint32(frame_ip, frame_ip_end, opcode1);
+                /* opcode1 was checked in loader and is no larger than
+                   UINT8_MAX */
+                opcode = (uint8)opcode1;
+
                 if (opcode != WASM_OP_ATOMIC_FENCE) {
                     read_leb_uint32(frame_ip, frame_ip_end, align);
                     read_leb_uint32(frame_ip, frame_ip_end, offset);
@@ -2096,6 +2456,8 @@ jit_compile_func(JitCompContext *cc)
                     case WASM_OP_ATOMIC_FENCE:
                         /* Skip memory index */
                         frame_ip++;
+                        if (!jit_compiler_op_atomic_fence(cc))
+                            return false;
                         break;
                     case WASM_OP_ATOMIC_I32_LOAD:
                         bytes = 4;
@@ -2192,15 +2554,12 @@ jit_compile_func(JitCompContext *cc)
                             return false;
                         break;
 
-                        /* TODO */
-                        /*
                         COMPILE_ATOMIC_RMW(Add, ADD);
                         COMPILE_ATOMIC_RMW(Sub, SUB);
                         COMPILE_ATOMIC_RMW(And, AND);
                         COMPILE_ATOMIC_RMW(Or, OR);
                         COMPILE_ATOMIC_RMW(Xor, XOR);
                         COMPILE_ATOMIC_RMW(Xchg, XCHG);
-                        */
 
                     build_atomic_rmw:
                         if (!jit_compile_op_atomic_rmw(cc, bin_op, op_type,
@@ -2255,76 +2614,8 @@ jit_frontend_translate_func(JitCompContext *cc)
     return basic_block_entry;
 }
 
-#if 0
-#if WASM_ENABLE_THREAD_MGR != 0
-bool
-check_suspend_flags(JitCompContext *cc, JITFuncContext *func_ctx)
+uint32
+jit_frontend_get_jitted_return_addr_offset()
 {
-    LLVMValueRef terminate_addr, terminate_flags, flag, offset, res;
-    JitBasicBlock *terminate_check_block, non_terminate_block;
-    JITFuncType *jit_func_type = func_ctx->jit_func->func_type;
-    JitBasicBlock *terminate_block;
-
-    /* Offset of suspend_flags */
-    offset = I32_FIVE;
-
-    if (!(terminate_addr = LLVMBuildInBoundsGEP(
-              cc->builder, func_ctx->exec_env, &offset, 1, "terminate_addr"))) {
-        jit_set_last_error("llvm build in bounds gep failed");
-        return false;
-    }
-    if (!(terminate_addr =
-              LLVMBuildBitCast(cc->builder, terminate_addr, INT32_PTR_TYPE,
-                               "terminate_addr_ptr"))) {
-        jit_set_last_error("llvm build bit cast failed");
-        return false;
-    }
-
-    if (!(terminate_flags =
-              LLVMBuildLoad(cc->builder, terminate_addr, "terminate_flags"))) {
-        jit_set_last_error("llvm build bit cast failed");
-        return false;
-    }
-    /* Set terminate_flags memory accecc to volatile, so that the value
-        will always be loaded from memory rather than register */
-    LLVMSetVolatile(terminate_flags, true);
-
-    CREATE_BASIC_BLOCK(terminate_check_block, "terminate_check");
-    MOVE_BASIC_BLOCK_AFTER_CURR(terminate_check_block);
-
-    CREATE_BASIC_BLOCK(non_terminate_block, "non_terminate");
-    MOVE_BASIC_BLOCK_AFTER_CURR(non_terminate_block);
-
-    BUILD_ICMP(LLVMIntSGT, terminate_flags, I32_ZERO, res, "need_terminate");
-    BUILD_COND_BR(res, terminate_check_block, non_terminate_block);
-
-    /* Move builder to terminate check block */
-    SET_BUILDER_POS(terminate_check_block);
-
-    CREATE_BASIC_BLOCK(terminate_block, "terminate");
-    MOVE_BASIC_BLOCK_AFTER_CURR(terminate_block);
-
-    if (!(flag = LLVMBuildAnd(cc->builder, terminate_flags, I32_ONE,
-                              "termination_flag"))) {
-        jit_set_last_error("llvm build AND failed");
-        return false;
-    }
-
-    BUILD_ICMP(LLVMIntSGT, flag, I32_ZERO, res, "need_terminate");
-    BUILD_COND_BR(res, terminate_block, non_terminate_block);
-
-    /* Move builder to terminate block */
-    SET_BUILDER_POS(terminate_block);
-    if (!jit_build_zero_function_ret(cc, func_ctx, jit_func_type)) {
-        goto fail;
-    }
-
-    /* Move builder to terminate block */
-    SET_BUILDER_POS(non_terminate_block);
-    return true;
-
-fail:
-    return false;
+    return (uint32)offsetof(WASMInterpFrame, jitted_return_addr);
 }
-#endif /* End of WASM_ENABLE_THREAD_MGR */
-#endif

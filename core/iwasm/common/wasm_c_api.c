@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
+#include "bh_log.h"
 #include "wasm_c_api_internal.h"
 
 #include "bh_assert.h"
@@ -22,6 +23,9 @@
 #if WASM_ENABLE_WASM_CACHE != 0
 #include <openssl/sha.h>
 #endif
+#if WASM_ENABLE_THREAD_MGR != 0
+#include "thread_manager.h"
+#endif
 
 /*
  * Thread Model:
@@ -38,6 +42,8 @@
 typedef struct wasm_module_ex_t {
     struct WASMModuleCommon *module_comm_rt;
     wasm_byte_vec_t *binary;
+    /* If true, binary in wasm_module_ex_t contains a copy of the WASM binary */
+    bool is_binary_cloned;
     korp_mutex lock;
     uint32 ref_count;
 #if WASM_ENABLE_WASM_CACHE != 0
@@ -275,7 +281,11 @@ WASM_DEFINE_VEC_OWN(store, wasm_store_delete)
 WASM_DEFINE_VEC_OWN(valtype, wasm_valtype_delete)
 
 #ifndef NDEBUG
+#if WASM_ENABLE_MEMORY_PROFILING != 0
 #define WASM_C_DUMP_PROC_MEM() LOG_PROC_MEM()
+#else
+#define WASM_C_DUMP_PROC_MEM() (void)0
+#endif
 #else
 #define WASM_C_DUMP_PROC_MEM() (void)0
 #endif
@@ -284,13 +294,57 @@ WASM_DEFINE_VEC_OWN(valtype, wasm_valtype_delete)
 own wasm_config_t *
 wasm_config_new(void)
 {
-    return NULL;
+    /* since wasm_runtime_malloc is not ready */
+    wasm_config_t *config = os_malloc(sizeof(wasm_config_t));
+    if (!config)
+        return NULL;
+
+    memset(config, 0, sizeof(wasm_config_t));
+    config->mem_alloc_type = Alloc_With_System_Allocator;
+
+    return config;
 }
 
 void
 wasm_config_delete(own wasm_config_t *config)
 {
-    (void)config;
+    if (config)
+        os_free(config);
+}
+
+wasm_config_t *
+wasm_config_set_mem_alloc_opt(wasm_config_t *config,
+                              mem_alloc_type_t mem_alloc_type,
+                              MemAllocOption *mem_alloc_option)
+{
+    if (!config)
+        return NULL;
+
+    config->mem_alloc_type = mem_alloc_type;
+    if (mem_alloc_option)
+        memcpy(&config->mem_alloc_option, mem_alloc_option,
+               sizeof(MemAllocOption));
+    return config;
+}
+
+wasm_config_t *
+wasm_config_set_linux_perf_opt(wasm_config_t *config, bool enable)
+{
+    if (!config)
+        return NULL;
+
+    config->enable_linux_perf = enable;
+    return config;
+}
+
+wasm_config_t *
+wasm_config_set_segue_flags(wasm_config_t *config, uint32 segue_flags)
+{
+    if (!config)
+        return NULL;
+
+    config->segue_flags = segue_flags;
+    return config;
 }
 
 static void
@@ -321,12 +375,14 @@ wasm_engine_delete_internal(wasm_engine_t *engine)
 }
 
 static wasm_engine_t *
-wasm_engine_new_internal(mem_alloc_type_t type, const MemAllocOption *opts)
+wasm_engine_new_internal(wasm_config_t *config)
 {
     wasm_engine_t *engine = NULL;
     /* init runtime */
     RuntimeInitArgs init_args = { 0 };
-    init_args.mem_alloc_type = type;
+#if WASM_ENABLE_JIT != 0
+    LLVMJITOptions *jit_options = wasm_runtime_get_llvm_jit_options();
+#endif
 
 #ifndef NDEBUG
     bh_log_set_verbose_level(BH_LOG_LEVEL_VERBOSE);
@@ -336,34 +392,16 @@ wasm_engine_new_internal(mem_alloc_type_t type, const MemAllocOption *opts)
 
     WASM_C_DUMP_PROC_MEM();
 
-    if (type == Alloc_With_Pool) {
-        if (!opts) {
-            return NULL;
-        }
+    /* wasm_config_t->MemAllocOption -> RuntimeInitArgs->MemAllocOption */
+    init_args.mem_alloc_type = config->mem_alloc_type;
+    memcpy(&init_args.mem_alloc_option, &config->mem_alloc_option,
+           sizeof(MemAllocOption));
+    init_args.enable_linux_perf = config->enable_linux_perf;
+    init_args.segue_flags = config->segue_flags;
 
-        init_args.mem_alloc_option.pool.heap_buf = opts->pool.heap_buf;
-        init_args.mem_alloc_option.pool.heap_size = opts->pool.heap_size;
-    }
-    else if (type == Alloc_With_Allocator) {
-        if (!opts) {
-            return NULL;
-        }
-
-        init_args.mem_alloc_option.allocator.malloc_func =
-            opts->allocator.malloc_func;
-        init_args.mem_alloc_option.allocator.free_func =
-            opts->allocator.free_func;
-        init_args.mem_alloc_option.allocator.realloc_func =
-            opts->allocator.realloc_func;
-#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
-        init_args.mem_alloc_option.allocator.user_data =
-            opts->allocator.user_data;
+#if WASM_ENABLE_JIT != 0
+    jit_options->quick_invoke_c_api_import = true;
 #endif
-    }
-    else {
-        init_args.mem_alloc_option.pool.heap_buf = NULL;
-        init_args.mem_alloc_option.pool.heap_size = 0;
-    }
 
     if (!wasm_runtime_full_init(&init_args)) {
         LOG_DEBUG("wasm_runtime_full_init failed");
@@ -393,7 +431,7 @@ wasm_engine_new_internal(mem_alloc_type_t type, const MemAllocOption *opts)
 }
 
 /* global engine instance */
-static wasm_engine_t *singleton_engine = NULL;
+static wasm_engine_t *singleton_engine;
 #ifdef os_thread_local_attribute
 /* categorize wasm_store_t as threads*/
 static os_thread_local_attribute unsigned thread_local_stores_num = 0;
@@ -410,14 +448,23 @@ static korp_mutex engine_lock = OS_THREAD_MUTEX_INITIALIZER;
 #endif
 
 own wasm_engine_t *
-wasm_engine_new_with_args(mem_alloc_type_t type, const MemAllocOption *opts)
+wasm_engine_new()
+{
+    wasm_config_t config = { 0 };
+    wasm_config_set_mem_alloc_opt(&config, Alloc_With_System_Allocator, NULL);
+    wasm_engine_t *engine = wasm_engine_new_with_config(&config);
+    return engine;
+}
+
+own wasm_engine_t *
+wasm_engine_new_with_config(wasm_config_t *config)
 {
 #if defined(OS_THREAD_MUTEX_INITIALIZER)
     os_mutex_lock(&engine_lock);
 #endif
 
     if (!singleton_engine)
-        singleton_engine = wasm_engine_new_internal(type, opts);
+        singleton_engine = wasm_engine_new_internal(config);
     else
         singleton_engine->ref_count++;
 
@@ -429,16 +476,12 @@ wasm_engine_new_with_args(mem_alloc_type_t type, const MemAllocOption *opts)
 }
 
 own wasm_engine_t *
-wasm_engine_new()
+wasm_engine_new_with_args(mem_alloc_type_t type, const MemAllocOption *opts)
 {
-    return wasm_engine_new_with_args(Alloc_With_System_Allocator, NULL);
-}
-
-own wasm_engine_t *
-wasm_engine_new_with_config(own wasm_config_t *config)
-{
-    (void)config;
-    return wasm_engine_new_with_args(Alloc_With_System_Allocator, NULL);
+    wasm_config_t config = { 0 };
+    config.mem_alloc_type = type;
+    memcpy(&config.mem_alloc_option, opts, sizeof(MemAllocOption));
+    return wasm_engine_new_with_config(&config);
 }
 
 void
@@ -495,7 +538,7 @@ search_thread_local_store_num(Vector *stores_by_tid, korp_tid tid,
 #endif
 
 static unsigned
-retrive_thread_local_store_num(Vector *stores_by_tid, korp_tid tid)
+retrieve_thread_local_store_num(Vector *stores_by_tid, korp_tid tid)
 {
 #ifndef os_thread_local_attribute
     unsigned i = 0;
@@ -623,8 +666,8 @@ wasm_store_new(wasm_engine_t *engine)
     if (!engine || singleton_engine != engine)
         return NULL;
 
-    if (!retrive_thread_local_store_num(&engine->stores_by_tid,
-                                        os_self_thread())) {
+    if (!retrieve_thread_local_store_num(&engine->stores_by_tid,
+                                         os_self_thread())) {
         if (!wasm_runtime_init_thread_env()) {
             LOG_ERROR("init thread environment failed");
             return NULL;
@@ -682,8 +725,8 @@ wasm_store_delete(wasm_store_t *store)
         return;
     }
 
-    DEINIT_VEC(store->modules, wasm_module_vec_delete);
     DEINIT_VEC(store->instances, wasm_instance_vec_delete);
+    DEINIT_VEC(store->modules, wasm_module_vec_delete);
     if (store->foreigns) {
         bh_vector_destroy(store->foreigns);
         wasm_runtime_free(store->foreigns);
@@ -693,8 +736,8 @@ wasm_store_delete(wasm_store_t *store)
 
     if (decrease_thread_local_store_num(&singleton_engine->stores_by_tid,
                                         os_self_thread())) {
-        if (!retrive_thread_local_store_num(&singleton_engine->stores_by_tid,
-                                            os_self_thread())) {
+        if (!retrieve_thread_local_store_num(&singleton_engine->stores_by_tid,
+                                             os_self_thread())) {
             wasm_runtime_destroy_thread_env();
         }
     }
@@ -713,11 +756,12 @@ val_type_rt_2_valkind(uint8 val_type_rt)
         WAMR_VAL_TYPE_2_WASM_VAL_KIND(I64)
         WAMR_VAL_TYPE_2_WASM_VAL_KIND(F32)
         WAMR_VAL_TYPE_2_WASM_VAL_KIND(F64)
+        WAMR_VAL_TYPE_2_WASM_VAL_KIND(V128)
         WAMR_VAL_TYPE_2_WASM_VAL_KIND(FUNCREF)
 #undef WAMR_VAL_TYPE_2_WASM_VAL_KIND
 
         default:
-            return WASM_ANYREF;
+            return WASM_EXTERNREF;
     }
 }
 
@@ -732,9 +776,9 @@ wasm_valtype_new(wasm_valkind_t kind)
 {
     wasm_valtype_t *val_type;
 
-    if (kind > WASM_F64 && WASM_FUNCREF != kind
-#if WASM_ENABLE_REF_TYPES != 0
-        && WASM_ANYREF != kind
+    if (kind > WASM_V128 && WASM_FUNCREF != kind
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+        && WASM_EXTERNREF != kind
 #endif
     ) {
         return NULL;
@@ -766,11 +810,11 @@ wasm_valtype_copy(const wasm_valtype_t *src)
 wasm_valkind_t
 wasm_valtype_kind(const wasm_valtype_t *val_type)
 {
-    return val_type ? val_type->kind : WASM_ANYREF;
+    return val_type ? val_type->kind : WASM_EXTERNREF;
 }
 
 static wasm_functype_t *
-wasm_functype_new_internal(WASMType *type_rt)
+wasm_functype_new_internal(WASMFuncType *type_rt)
 {
     wasm_functype_t *type = NULL;
     wasm_valtype_t *param_type = NULL, *result_type = NULL;
@@ -786,7 +830,7 @@ wasm_functype_new_internal(WASMType *type_rt)
 
     type->extern_kind = WASM_EXTERN_FUNC;
 
-    /* WASMType->types[0 : type_rt->param_count) -> type->params */
+    /* WASMFuncType->types[0 : type_rt->param_count) -> type->params */
     INIT_VEC(type->params, wasm_valtype_vec_new_uninitialized,
              type_rt->param_count);
     for (i = 0; i < type_rt->param_count; ++i) {
@@ -800,7 +844,7 @@ wasm_functype_new_internal(WASMType *type_rt)
         }
     }
 
-    /* WASMType->types[type_rt->param_count : type_rt->result_count) ->
+    /* WASMFuncType->types[type_rt->param_count : type_rt->result_count) ->
      * type->results */
     INIT_VEC(type->results, wasm_valtype_vec_new_uninitialized,
              type_rt->result_count);
@@ -933,7 +977,8 @@ cmp_val_kind_with_val_type(wasm_valkind_t v_k, uint8 v_t)
            || (v_k == WASM_I64 && v_t == VALUE_TYPE_I64)
            || (v_k == WASM_F32 && v_t == VALUE_TYPE_F32)
            || (v_k == WASM_F64 && v_t == VALUE_TYPE_F64)
-           || (v_k == WASM_ANYREF && v_t == VALUE_TYPE_EXTERNREF)
+           || (v_k == WASM_V128 && v_t == VALUE_TYPE_V128)
+           || (v_k == WASM_EXTERNREF && v_t == VALUE_TYPE_EXTERNREF)
            || (v_k == WASM_FUNCREF && v_t == VALUE_TYPE_FUNCREF);
 }
 
@@ -942,7 +987,7 @@ cmp_val_kind_with_val_type(wasm_valkind_t v_k, uint8 v_t)
  */
 static bool
 wasm_functype_same_internal(const wasm_functype_t *type,
-                            const WASMType *type_intl)
+                            const WASMFuncType *type_intl)
 {
     uint32 i = 0;
 
@@ -1091,8 +1136,8 @@ wasm_tabletype_new(own wasm_valtype_t *val_type, const wasm_limits_t *limits)
     }
 
     if (wasm_valtype_kind(val_type) != WASM_FUNCREF
-#if WASM_ENABLE_REF_TYPES != 0
-        && wasm_valtype_kind(val_type) != WASM_ANYREF
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+        && wasm_valtype_kind(val_type) != WASM_EXTERNREF
 #endif
     ) {
         return NULL;
@@ -1453,6 +1498,30 @@ wasm_importtype_type(const wasm_importtype_t *import_type)
     return import_type->extern_type;
 }
 
+bool
+wasm_importtype_is_linked(const wasm_importtype_t *import_type)
+{
+    if (!import_type)
+        return false;
+
+    const wasm_name_t *module_name = wasm_importtype_module(import_type);
+    const wasm_name_t *field_name = wasm_importtype_name(import_type);
+
+    switch (wasm_externtype_kind(wasm_importtype_type(import_type))) {
+        case WASM_EXTERN_FUNC:
+            return wasm_runtime_is_import_func_linked(module_name->data,
+                                                      field_name->data);
+        case WASM_EXTERN_GLOBAL:
+            return wasm_runtime_is_import_global_linked(module_name->data,
+                                                        field_name->data);
+        case WASM_EXTERN_MEMORY:
+        case WASM_EXTERN_TABLE:
+        default:
+            break;
+    }
+    return false;
+}
+
 own wasm_exporttype_t *
 wasm_exporttype_new(own wasm_byte_vec_t *name,
                     own wasm_externtype_t *extern_type)
@@ -1581,9 +1650,12 @@ rt_val_to_wasm_val(const uint8 *data, uint8 val_type_rt, wasm_val_t *out)
             out->kind = WASM_F64;
             out->of.f64 = *((float64 *)data);
             break;
-#if WASM_ENABLE_REF_TYPES != 0
+        case VALUE_TYPE_V128:
+            bh_assert(0);
+            break;
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
         case VALUE_TYPE_EXTERNREF:
-            out->kind = WASM_ANYREF;
+            out->kind = WASM_EXTERNREF;
             if (NULL_REF == *(uint32 *)data) {
                 out->of.ref = NULL;
             }
@@ -1622,9 +1694,12 @@ wasm_val_to_rt_val(WASMModuleInstanceCommon *inst_comm_rt, uint8 val_type_rt,
             bh_assert(WASM_F64 == v->kind);
             *((float64 *)data) = v->of.f64;
             break;
-#if WASM_ENABLE_REF_TYPES != 0
+        case VALUE_TYPE_V128:
+            bh_assert(0);
+            break;
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
         case VALUE_TYPE_EXTERNREF:
-            bh_assert(WASM_ANYREF == v->kind);
+            bh_assert(WASM_EXTERNREF == v->kind);
             ret =
                 wasm_externref_obj2ref(inst_comm_rt, v->of.ref, (uint32 *)data);
             break;
@@ -1635,6 +1710,7 @@ wasm_val_to_rt_val(WASMModuleInstanceCommon *inst_comm_rt, uint8 val_type_rt,
             break;
     }
 
+    (void)inst_comm_rt;
     return ret;
 }
 
@@ -1855,10 +1931,28 @@ wasm_frame_func_offset(const wasm_frame_t *frame)
     return frame ? frame->func_offset : 0;
 }
 
+void
+wasm_frame_vec_clone_internal(Vector *src, Vector *out)
+{
+    if (src->num_elems == 0) {
+        bh_vector_destroy(out);
+        return;
+    }
+
+    if (!bh_vector_destroy(out)
+        || !bh_vector_init(out, src->num_elems, sizeof(WASMCApiFrame), false)) {
+        return;
+    }
+
+    bh_memcpy_s(out->data, (uint32)(src->num_elems * sizeof(WASMCApiFrame)),
+                src->data, (uint32)(src->num_elems * sizeof(WASMCApiFrame)));
+    out->num_elems = src->num_elems;
+}
+
 static wasm_trap_t *
 wasm_trap_new_internal(wasm_store_t *store,
                        WASMModuleInstanceCommon *inst_comm_rt,
-                       const char *error_info)
+                       const char *error_info, Vector *cluster_frames)
 {
     wasm_trap_t *trap;
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
@@ -1875,7 +1969,7 @@ wasm_trap_new_internal(wasm_store_t *store,
     }
 
     /* fill in message */
-    if (strlen(error_info) > 0) {
+    if (error_info && strlen(error_info) > 0) {
         if (!(trap->message = malloc_internal(sizeof(wasm_byte_vec_t)))) {
             goto failed;
         }
@@ -1888,7 +1982,9 @@ wasm_trap_new_internal(wasm_store_t *store,
 
     /* fill in frames */
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
-    trap->frames = ((WASMModuleInstance *)inst_comm_rt)->frames;
+    trap->frames = cluster_frames
+                       ? cluster_frames
+                       : ((WASMModuleInstance *)inst_comm_rt)->frames;
 
     if (trap->frames) {
         /* fill in instances */
@@ -1907,6 +2003,9 @@ wasm_trap_new_internal(wasm_store_t *store,
                 frame_instance;
         }
     }
+#else
+    (void)store;
+    (void)inst_comm_rt;
 #endif /* WASM_ENABLE_DUMP_CALL_STACK != 0 */
 
     return trap;
@@ -1996,10 +2095,7 @@ wasm_trap_trace(const wasm_trap_t *trap, own wasm_frame_vec_t *out)
     }
 
     for (i = 0; i < trap->frames->num_elems; i++) {
-        wasm_frame_t *frame;
-
-        frame = ((wasm_frame_t *)trap->frames->data) + i;
-
+        wasm_frame_t *frame = ((wasm_frame_t *)trap->frames->data) + i;
         if (!(out->data[i] =
                   wasm_frame_new(frame->instance, frame->module_offset,
                                  frame->func_index, frame->func_offset))) {
@@ -2034,6 +2130,7 @@ wasm_foreign_new_internal(wasm_store_t *store, uint32 foreign_idx_rt,
     }
 
     foreign->ref_cnt++;
+    (void)inst_comm_rt;
     return foreign;
 }
 
@@ -2147,7 +2244,7 @@ quit:
 #endif /* WASM_ENABLE_WASM_CACHE != 0 */
 
 wasm_module_t *
-wasm_module_new(wasm_store_t *store, const wasm_byte_vec_t *binary)
+wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
 {
     char error_buf[128] = { 0 };
     wasm_module_ex_t *module_ex = NULL;
@@ -2175,7 +2272,7 @@ wasm_module_new(wasm_store_t *store, const wasm_byte_vec_t *binary)
         result = result || (pkg_type == Wasm_Module_AoT);
 #endif
         if (!result) {
-            LOG_VERBOSE("current building isn't compatiable with the module,"
+            LOG_VERBOSE("current building isn't compatible with the module,"
                         "may need recompile");
             goto quit;
         }
@@ -2183,7 +2280,7 @@ wasm_module_new(wasm_store_t *store, const wasm_byte_vec_t *binary)
 
 #if WASM_ENABLE_WASM_CACHE != 0
     /* if cached */
-    SHA256((void *)binary->data, binary->num_elems, binary_hash);
+    SHA256((void *)binary->data, binary->num_elems, (uint8_t *)binary_hash);
     module_ex = try_reuse_loaded_module(store, binary_hash);
     if (module_ex)
         return module_ext_to_module(module_ex);
@@ -2195,19 +2292,26 @@ wasm_module_new(wasm_store_t *store, const wasm_byte_vec_t *binary)
     if (!module_ex)
         goto quit;
 
-    module_ex->binary = malloc_internal(sizeof(wasm_byte_vec_t));
-    if (!module_ex->binary)
-        goto free_module;
+    module_ex->is_binary_cloned = args->clone_wasm_binary;
+    if (args->clone_wasm_binary) {
+        module_ex->binary = malloc_internal(sizeof(wasm_byte_vec_t));
+        if (!module_ex->binary)
+            goto free_module;
 
-    wasm_byte_vec_copy(module_ex->binary, binary);
-    if (!module_ex->binary->data)
-        goto free_binary;
+        wasm_byte_vec_copy(module_ex->binary, binary);
+        if (!module_ex->binary->data)
+            goto free_binary;
+    }
+    else {
+        module_ex->binary = binary;
+    }
 
-    module_ex->module_comm_rt = wasm_runtime_load(
-        (uint8 *)module_ex->binary->data, (uint32)module_ex->binary->size,
+    args->wasm_binary_freeable = !args->clone_wasm_binary;
+    module_ex->module_comm_rt = wasm_runtime_load_ex(
+        (uint8 *)module_ex->binary->data, (uint32)module_ex->binary->size, args,
         error_buf, (uint32)sizeof(error_buf));
     if (!(module_ex->module_comm_rt)) {
-        LOG_ERROR(error_buf);
+        LOG_ERROR("%s", error_buf);
         goto free_vec;
     }
 
@@ -2240,9 +2344,11 @@ remove_last:
 unload:
     wasm_runtime_unload(module_ex->module_comm_rt);
 free_vec:
-    wasm_byte_vec_delete(module_ex->binary);
+    if (args->clone_wasm_binary)
+        wasm_byte_vec_delete(module_ex->binary);
 free_binary:
-    wasm_runtime_free(module_ex->binary);
+    if (args->clone_wasm_binary)
+        wasm_runtime_free(module_ex->binary);
 free_module:
     wasm_runtime_free(module_ex);
 quit:
@@ -2250,11 +2356,22 @@ quit:
     return NULL;
 }
 
+wasm_module_t *
+wasm_module_new(wasm_store_t *store, const wasm_byte_vec_t *binary)
+{
+    LoadArgs args = { 0 };
+    args.name = "";
+    args.clone_wasm_binary = true;
+    return wasm_module_new_ex(store, (wasm_byte_vec_t *)binary, &args);
+}
+
 bool
 wasm_module_validate(wasm_store_t *store, const wasm_byte_vec_t *binary)
 {
+    wasm_byte_vec_t local_binary = { 0 };
     struct WASMModuleCommon *module_rt;
     char error_buf[128] = { 0 };
+    bool ret;
 
     bh_assert(singleton_engine);
 
@@ -2263,15 +2380,25 @@ wasm_module_validate(wasm_store_t *store, const wasm_byte_vec_t *binary)
         return false;
     }
 
-    if ((module_rt = wasm_runtime_load((uint8 *)binary->data,
-                                       (uint32)binary->size, error_buf, 128))) {
+    /* make a copy of binary */
+    wasm_byte_vec_copy(&local_binary, binary);
+
+    if (binary->size && !local_binary.data)
+        return false;
+
+    module_rt = wasm_runtime_load((uint8 *)local_binary.data,
+                                  (uint32)local_binary.size, error_buf, 128);
+    wasm_byte_vec_delete(&local_binary);
+    if (module_rt) {
         wasm_runtime_unload(module_rt);
-        return true;
+        ret = true;
     }
     else {
-        LOG_VERBOSE(error_buf);
-        return false;
+        ret = false;
+        LOG_VERBOSE("%s", error_buf);
     }
+
+    return ret;
 }
 
 static void
@@ -2294,7 +2421,8 @@ wasm_module_delete_internal(wasm_module_t *module)
         return;
     }
 
-    DEINIT_VEC(module_ex->binary, wasm_byte_vec_delete);
+    if (module_ex->is_binary_cloned)
+        DEINIT_VEC(module_ex->binary, wasm_byte_vec_delete);
 
     if (module_ex->module_comm_rt) {
         wasm_runtime_unload(module_ex->module_comm_rt);
@@ -2371,7 +2499,7 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
 
         if (i < import_func_count) {
             wasm_functype_t *type = NULL;
-            WASMType *type_rt = NULL;
+            WASMFuncType *type_rt = NULL;
 
 #if WASM_ENABLE_INTERP != 0
             if ((*module)->module_type == Wasm_Module_Bytecode) {
@@ -2413,8 +2541,8 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
                                      + (i - import_func_count);
                 module_name_rt = import->u.names.module_name;
                 field_name_rt = import->u.names.field_name;
-                val_type_rt = import->u.global.type;
-                mutability_rt = import->u.global.is_mutable;
+                val_type_rt = import->u.global.type.val_type;
+                mutability_rt = import->u.global.type.is_mutable;
             }
 #endif
 
@@ -2424,8 +2552,8 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
                                           + (i - import_func_count);
                 module_name_rt = import->module_name;
                 field_name_rt = import->global_name;
-                val_type_rt = import->type;
-                mutability_rt = import->is_mutable;
+                val_type_rt = import->type.val_type;
+                mutability_rt = import->type.is_mutable;
             }
 #endif
 
@@ -2452,8 +2580,8 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
                     + (i - import_func_count - import_global_count);
                 module_name_rt = import->u.names.module_name;
                 field_name_rt = import->u.names.field_name;
-                min_page = import->u.memory.init_page_count;
-                max_page = import->u.memory.max_page_count;
+                min_page = import->u.memory.mem_type.init_page_count;
+                max_page = import->u.memory.mem_type.max_page_count;
             }
 #endif
 
@@ -2464,8 +2592,8 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
                     + (i - import_func_count - import_global_count);
                 module_name_rt = import->module_name;
                 field_name_rt = import->memory_name;
-                min_page = import->mem_init_page_count;
-                max_page = import->mem_max_page_count;
+                min_page = import->mem_type.init_page_count;
+                max_page = import->mem_type.max_page_count;
             }
 #endif
 
@@ -2492,9 +2620,9 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
                        - import_memory_count);
                 module_name_rt = import->u.names.module_name;
                 field_name_rt = import->u.names.field_name;
-                elem_type_rt = import->u.table.elem_type;
-                min_size = import->u.table.init_size;
-                max_size = import->u.table.max_size;
+                elem_type_rt = import->u.table.table_type.elem_type;
+                min_size = import->u.table.table_type.init_size;
+                max_size = import->u.table.table_type.max_size;
             }
 #endif
 
@@ -2506,9 +2634,9 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
                        - import_memory_count);
                 module_name_rt = import->module_name;
                 field_name_rt = import->table_name;
-                elem_type_rt = import->elem_type;
-                min_size = import->table_init_size;
-                max_size = import->table_max_size;
+                elem_type_rt = import->table_type.elem_type;
+                min_size = import->table_type.init_size;
+                max_size = import->table_type.max_size;
             }
 #endif
 
@@ -2526,12 +2654,12 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
 
         bh_assert(extern_type);
 
-        wasm_name_new_from_string(&module_name, module_name_rt);
+        wasm_name_new_from_string_nt(&module_name, module_name_rt);
         if (strlen(module_name_rt) && !module_name.data) {
             goto failed;
         }
 
-        wasm_name_new_from_string(&name, field_name_rt);
+        wasm_name_new_from_string_nt(&name, field_name_rt);
         if (strlen(field_name_rt) && !name.data) {
             goto failed;
         }
@@ -2611,18 +2739,18 @@ wasm_module_exports(const wasm_module_t *module, wasm_exporttype_vec_t *out)
         }
 
         /* byte* -> wasm_byte_vec_t */
-        wasm_name_new_from_string(&name, export->name);
+        wasm_name_new_from_string_nt(&name, export->name);
         if (strlen(export->name) && !name.data) {
             goto failed;
         }
 
-        /* WASMExport -> (WASMType, (uint8, bool)) -> (wasm_functype_t,
+        /* WASMExport -> (WASMFuncType, (uint8, bool)) -> (wasm_functype_t,
          * wasm_globaltype_t) -> wasm_externtype_t*/
         switch (export->kind) {
             case EXPORT_KIND_FUNC:
             {
                 wasm_functype_t *type = NULL;
-                WASMType *type_rt;
+                WASMFuncType *type_rt;
 
                 if (!wasm_runtime_get_export_func_type(*module, export,
                                                        &type_rt)) {
@@ -2677,12 +2805,22 @@ wasm_module_exports(const wasm_module_t *module, wasm_exporttype_vec_t *out)
             {
                 wasm_tabletype_t *type = NULL;
                 uint8 elem_type_rt = 0;
+#if WASM_ENABLE_GC != 0
+                WASMRefType *elem_ref_type_rt;
+#endif
                 uint32 min_size = 0, max_size = 0;
 
-                if (!wasm_runtime_get_export_table_type(
-                        *module, export, &elem_type_rt, &min_size, &max_size)) {
+                if (!wasm_runtime_get_export_table_type(*module, export,
+                                                        &elem_type_rt,
+#if WASM_ENABLE_GC != 0
+                                                        &elem_ref_type_rt,
+#endif
+                                                        &min_size, &max_size)) {
                     goto failed;
                 }
+#if WASM_ENABLE_GC != 0
+                (void)elem_ref_type_rt; /* TODO */
+#endif
 
                 if (!(type = wasm_tabletype_new_internal(elem_type_rt, min_size,
                                                          max_size))) {
@@ -2840,6 +2978,43 @@ wasm_shared_module_delete(own wasm_shared_module_t *shared_module)
     wasm_module_delete_internal((wasm_module_t *)shared_module);
 }
 
+bool
+wasm_module_set_name(wasm_module_t *module, const char *name)
+{
+    char error_buf[256] = { 0 };
+    wasm_module_ex_t *module_ex = NULL;
+
+    if (!module)
+        return false;
+
+    module_ex = module_to_module_ext(module);
+    bool ret = wasm_runtime_set_module_name(module_ex->module_comm_rt, name,
+                                            error_buf, sizeof(error_buf) - 1);
+    if (!ret)
+        LOG_WARNING("set module name failed: %s", error_buf);
+    return ret;
+}
+
+const char *
+wasm_module_get_name(wasm_module_t *module)
+{
+    wasm_module_ex_t *module_ex = NULL;
+    if (!module)
+        return "";
+
+    module_ex = module_to_module_ext(module);
+    return wasm_runtime_get_module_name(module_ex->module_comm_rt);
+}
+
+bool
+wasm_module_is_underlying_binary_freeable(const wasm_module_t *module)
+{
+    if (((wasm_module_ex_t *)module)->is_binary_cloned)
+        return true;
+
+    return wasm_runtime_is_underlying_binary_freeable(*module);
+}
+
 static wasm_func_t *
 wasm_func_new_basic(wasm_store_t *store, const wasm_functype_t *type,
                     wasm_func_callback_t func_callback)
@@ -2863,6 +3038,10 @@ wasm_func_new_basic(wasm_store_t *store, const wasm_functype_t *type,
     if (!(func->type = wasm_functype_copy(type))) {
         goto failed;
     }
+    /* func type's param_count and result_count were checked in
+       loader and are no larger than UINT16_MAX */
+    func->param_count = (uint16)func->type->params->num_elems;
+    func->result_count = (uint16)func->type->results->num_elems;
 
     RETURN_OBJ(func, wasm_func_delete)
 }
@@ -2893,6 +3072,10 @@ wasm_func_new_with_env_basic(wasm_store_t *store, const wasm_functype_t *type,
     if (!(func->type = wasm_functype_copy(type))) {
         goto failed;
     }
+    /* func type's param_count and result_count were checked in
+       loader and are no larger than UINT16_MAX */
+    func->param_count = (uint16)func->type->params->num_elems;
+    func->result_count = (uint16)func->type->results->num_elems;
 
     RETURN_OBJ(func, wasm_func_delete)
 }
@@ -2925,7 +3108,7 @@ wasm_func_new_internal(wasm_store_t *store, uint16 func_idx_rt,
                        WASMModuleInstanceCommon *inst_comm_rt)
 {
     wasm_func_t *func = NULL;
-    WASMType *type_rt = NULL;
+    WASMFuncType *type_rt = NULL;
 
     bh_assert(singleton_engine);
 
@@ -2963,9 +3146,9 @@ wasm_func_new_internal(wasm_store_t *store, uint16 func_idx_rt,
         }
         else {
             type_rt =
-                module_aot->func_types[module_aot->func_type_indexes
-                                           [func_idx_rt
-                                            - module_aot->import_func_count]];
+                (AOTFuncType *)module_aot
+                    ->types[module_aot->func_type_indexes
+                                [func_idx_rt - module_aot->import_func_count]];
         }
     }
 #endif
@@ -2982,6 +3165,10 @@ wasm_func_new_internal(wasm_store_t *store, uint16 func_idx_rt,
     if (!func->type) {
         goto failed;
     }
+    /* func type's param_count and result_count were checked in
+       loader and are no larger than UINT16_MAX */
+    func->param_count = (uint16)func->type->params->num_elems;
+    func->result_count = (uint16)func->type->results->num_elems;
 
     /* will add name information when processing "exports" */
     func->store = store;
@@ -2995,6 +3182,20 @@ failed:
     LOG_DEBUG("%s failed", __FUNCTION__);
     wasm_func_delete(func);
     return NULL;
+}
+
+static wasm_func_t *
+wasm_func_new_empty(wasm_store_t *store)
+{
+    wasm_func_t *func = NULL;
+
+    if (!(func = malloc_internal(sizeof(wasm_func_t))))
+        goto failed;
+
+    func->store = store;
+    func->kind = WASM_EXTERN_FUNC;
+
+    RETURN_OBJ(func, wasm_func_delete)
 }
 
 void
@@ -3059,48 +3260,33 @@ params_to_argv(const wasm_val_vec_t *params,
                const wasm_valtype_vec_t *param_defs, uint32 *argv,
                uint32 *ptr_argc)
 {
-    size_t i = 0;
+    uint32 *argv_org = argv;
+    const wasm_val_t *param, *param_end;
 
-    if (!param_defs->num_elems) {
-        return true;
-    }
+    bh_assert(params && params->num_elems && params->size && params->data);
 
-    if (!params || !params->num_elems || !params->size || !params->data) {
-        LOG_ERROR("the parameter params is invalid");
-        return false;
-    }
+    param = params->data;
+    param_end = param + param_defs->num_elems;
 
-    *ptr_argc = 0;
-    for (i = 0; i < param_defs->num_elems; ++i) {
-        const wasm_val_t *param = params->data + i;
-        bh_assert((*(param_defs->data + i))->kind == param->kind);
-
+    for (; param < param_end; param++) {
         switch (param->kind) {
             case WASM_I32:
+            case WASM_F32:
                 *(int32 *)argv = param->of.i32;
                 argv += 1;
-                *ptr_argc += 1;
                 break;
             case WASM_I64:
+            case WASM_F64:
                 *(int64 *)argv = param->of.i64;
                 argv += 2;
-                *ptr_argc += 2;
                 break;
-            case WASM_F32:
-                *(float32 *)argv = param->of.f32;
-                argv += 1;
-                *ptr_argc += 1;
+            case WASM_V128:
+                bh_assert(0);
                 break;
-            case WASM_F64:
-                *(float64 *)argv = param->of.f64;
-                argv += 2;
-                *ptr_argc += 2;
-                break;
-#if WASM_ENABLE_REF_TYPES != 0
-            case WASM_ANYREF:
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+            case WASM_EXTERNREF:
                 *(uintptr_t *)argv = (uintptr_t)param->of.ref;
                 argv += sizeof(uintptr_t) / sizeof(uint32);
-                *ptr_argc += 1;
                 break;
 #endif
             default:
@@ -3109,6 +3295,7 @@ params_to_argv(const wasm_val_vec_t *params,
         }
     }
 
+    *ptr_argc = (uint32)(argv - argv_org);
     return true;
 }
 
@@ -3116,62 +3303,41 @@ static bool
 argv_to_results(const uint32 *argv, const wasm_valtype_vec_t *result_defs,
                 wasm_val_vec_t *results)
 {
-    size_t i = 0, argv_i = 0;
+    wasm_valtype_t **result_def, **result_def_end;
     wasm_val_t *result;
 
-    if (!result_defs->num_elems) {
-        return true;
-    }
+    bh_assert(results && results->size && results->data);
 
-    if (!results || !results->size || !results->data) {
-        LOG_ERROR("the parameter results is invalid");
-        return false;
-    }
+    result_def = result_defs->data;
+    result_def_end = result_def + result_defs->num_elems;
+    result = results->data;
 
-    for (i = 0, result = results->data, argv_i = 0; i < result_defs->num_elems;
-         i++, result++) {
-        switch (result_defs->data[i]->kind) {
+    for (; result_def < result_def_end; result_def++, result++) {
+        result->kind = result_def[0]->kind;
+        switch (result->kind) {
             case WASM_I32:
-            {
-                result->kind = WASM_I32;
-                result->of.i32 = *(int32 *)(argv + argv_i);
-                argv_i += 1;
-                break;
-            }
-            case WASM_I64:
-            {
-                result->kind = WASM_I64;
-                result->of.i64 = *(int64 *)(argv + argv_i);
-                argv_i += 2;
-                break;
-            }
             case WASM_F32:
-            {
-                result->kind = WASM_F32;
-                result->of.f32 = *(float32 *)(argv + argv_i);
-                argv_i += 1;
+                result->of.i32 = *(int32 *)argv;
+                argv += 1;
                 break;
-            }
+            case WASM_I64:
             case WASM_F64:
-            {
-                result->kind = WASM_F64;
-                result->of.f64 = *(float64 *)(argv + argv_i);
-                argv_i += 2;
+                result->of.i64 = *(int64 *)argv;
+                argv += 2;
                 break;
-            }
-#if WASM_ENABLE_REF_TYPES != 0
-            case WASM_ANYREF:
-            {
-                result->kind = WASM_ANYREF;
-                result->of.ref =
-                    (struct wasm_ref_t *)(*(uintptr_t *)(argv + argv_i));
-                argv_i += sizeof(uintptr_t) / sizeof(uint32);
+            case WASM_V128:
+                bh_assert(0);
                 break;
-            }
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+            case WASM_EXTERNREF:
+            case WASM_FUNCREF:
+                result->of.ref = (struct wasm_ref_t *)(*(uintptr_t *)argv);
+                argv += sizeof(uintptr_t) / sizeof(uint32);
+                break;
 #endif
             default:
                 LOG_WARNING("%s meets unsupported type: %d", __FUNCTION__,
-                            result_defs->data[i]->kind);
+                            result->kind);
                 return false;
         }
     }
@@ -3191,55 +3357,38 @@ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
     WASMFunctionInstanceCommon *func_comm_rt = NULL;
     WASMExecEnv *exec_env = NULL;
     size_t param_count, result_count, alloc_count;
+    Vector *cluster_frames = NULL;
 
-    if (!func) {
-        return NULL;
-    }
+    bh_assert(func && func->type);
 
     if (!func->inst_comm_rt) {
         wasm_name_t message = { 0 };
         wasm_trap_t *trap;
 
-        wasm_name_new_from_string(&message, "failed to call unlinked function");
+        wasm_name_new_from_string_nt(&message,
+                                     "failed to call unlinked function");
         trap = wasm_trap_new(func->store, &message);
         wasm_byte_vec_delete(&message);
 
         return trap;
     }
 
-    bh_assert(func->type);
-
-#if WASM_ENABLE_INTERP != 0
     if (func->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
+#if WASM_ENABLE_INTERP != 0
         func_comm_rt = ((WASMModuleInstance *)func->inst_comm_rt)->e->functions
                        + func->func_idx_rt;
-    }
 #endif
-
+    }
+    else if (func->inst_comm_rt->module_type == Wasm_Module_AoT) {
 #if WASM_ENABLE_AOT != 0
-    if (func->inst_comm_rt->module_type == Wasm_Module_AoT) {
         if (!(func_comm_rt = func->func_comm_rt)) {
             AOTModuleInstance *inst_aot =
                 (AOTModuleInstance *)func->inst_comm_rt;
-            AOTModule *module_aot = (AOTModule *)inst_aot->module;
-            uint32 export_i = 0, export_func_j = 0;
-
-            for (; export_i < module_aot->export_count; ++export_i) {
-                AOTExport *export = module_aot->exports + export_i;
-                if (export->kind == EXPORT_KIND_FUNC) {
-                    if (export->index == func->func_idx_rt) {
-                        func_comm_rt =
-                            (AOTFunctionInstance *)inst_aot->export_functions
-                            + export_func_j;
-                        ((wasm_func_t *)func)->func_comm_rt = func_comm_rt;
-                        break;
-                    }
-                    export_func_j++;
-                }
-            }
+            func_comm_rt = ((wasm_func_t *)func)->func_comm_rt =
+                aot_lookup_function_with_idx(inst_aot, func->func_idx_rt);
         }
-    }
 #endif
+    }
 
     /*
      * a wrong combination of module filetype and compilation flags
@@ -3259,14 +3408,24 @@ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
         }
     }
 
-    /* copy parametes */
+    /* copy parameters */
     if (param_count
         && !params_to_argv(params, wasm_functype_params(func->type), argv,
                            &argc)) {
         goto failed;
     }
 
-    exec_env = wasm_runtime_get_exec_env_singleton(func->inst_comm_rt);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    exec_env = wasm_runtime_get_exec_env_tls();
+#endif
+#if WASM_ENABLE_THREAD_MGR != 0
+    if (!exec_env) {
+        exec_env = wasm_clusters_search_exec_env(func->inst_comm_rt);
+    }
+#endif
+    if (!exec_env) {
+        exec_env = wasm_runtime_get_exec_env_singleton(func->inst_comm_rt);
+    }
     if (!exec_env) {
         goto failed;
     }
@@ -3274,7 +3433,7 @@ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
     wasm_runtime_set_exception(func->inst_comm_rt, NULL);
     if (!wasm_runtime_call_wasm(exec_env, func_comm_rt, argc, argv)) {
         if (wasm_runtime_get_exception(func->inst_comm_rt)) {
-            LOG_DEBUG(wasm_runtime_get_exception(func->inst_comm_rt));
+            LOG_DEBUG("%s", wasm_runtime_get_exception(func->inst_comm_rt));
             goto failed;
         }
     }
@@ -3283,6 +3442,8 @@ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
     if (result_count) {
         if (!argv_to_results(argv, wasm_functype_results(func->type),
                              results)) {
+            wasm_runtime_set_exception(func->inst_comm_rt,
+                                       "argv_to_results failed");
             goto failed;
         }
         results->num_elems = result_count;
@@ -3297,27 +3458,32 @@ failed:
     if (argv != argv_buf)
         wasm_runtime_free(argv);
 
-    return wasm_trap_new_internal(
+#if WASM_ENABLE_DUMP_CALL_STACK != 0 && WASM_ENABLE_THREAD_MGR != 0
+    WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);
+    cluster_frames = &cluster->exception_frames;
+    wasm_cluster_traverse_lock(exec_env);
+#endif
+
+    wasm_trap_t *trap = wasm_trap_new_internal(
         func->store, func->inst_comm_rt,
-        wasm_runtime_get_exception(func->inst_comm_rt));
+        wasm_runtime_get_exception(func->inst_comm_rt), cluster_frames);
+
+#if WASM_ENABLE_DUMP_CALL_STACK != 0 && WASM_ENABLE_THREAD_MGR != 0
+    wasm_cluster_traverse_unlock(exec_env);
+#endif
+    return trap;
 }
 
 size_t
 wasm_func_param_arity(const wasm_func_t *func)
 {
-    if (!func || !func->type || !func->type->params) {
-        return 0;
-    }
-    return func->type->params->num_elems;
+    return func->param_count;
 }
 
 size_t
 wasm_func_result_arity(const wasm_func_t *func)
 {
-    if (!func || !func->type || !func->type->results) {
-        return 0;
-    }
-    return func->type->results->num_elems;
+    return func->result_count;
 }
 
 wasm_global_t *
@@ -3354,6 +3520,25 @@ wasm_global_new(wasm_store_t *store, const wasm_globaltype_t *global_type,
 
     return global;
 
+failed:
+    LOG_DEBUG("%s failed", __FUNCTION__);
+    wasm_global_delete(global);
+    return NULL;
+}
+
+static wasm_global_t *
+wasm_global_new_empty(wasm_store_t *store)
+{
+    wasm_global_t *global = NULL;
+
+    global = malloc_internal(sizeof(wasm_global_t));
+    if (!global)
+        goto failed;
+
+    global->store = store;
+    global->kind = WASM_EXTERN_GLOBAL;
+
+    return global;
 failed:
     LOG_DEBUG("%s failed", __FUNCTION__);
     wasm_global_delete(global);
@@ -3473,7 +3658,7 @@ aot_global_set(const AOTModuleInstance *inst_aot, uint16 global_idx_rt,
 
     if (global_idx_rt < module_aot->import_global_count) {
         data_offset = module_aot->import_globals[global_idx_rt].data_offset;
-        val_type_rt = module_aot->import_globals[global_idx_rt].type;
+        val_type_rt = module_aot->import_globals[global_idx_rt].type.val_type;
     }
     else {
         data_offset =
@@ -3481,7 +3666,7 @@ aot_global_set(const AOTModuleInstance *inst_aot, uint16 global_idx_rt,
                 .data_offset;
         val_type_rt =
             module_aot->globals[global_idx_rt - module_aot->import_global_count]
-                .type;
+                .type.val_type;
     }
 
     data = (void *)(inst_aot->global_data + data_offset);
@@ -3500,7 +3685,7 @@ aot_global_get(const AOTModuleInstance *inst_aot, uint16 global_idx_rt,
 
     if (global_idx_rt < module_aot->import_global_count) {
         data_offset = module_aot->import_globals[global_idx_rt].data_offset;
-        val_type_rt = module_aot->import_globals[global_idx_rt].type;
+        val_type_rt = module_aot->import_globals[global_idx_rt].type.val_type;
     }
     else {
         data_offset =
@@ -3508,7 +3693,7 @@ aot_global_get(const AOTModuleInstance *inst_aot, uint16 global_idx_rt,
                 .data_offset;
         val_type_rt =
             module_aot->globals[global_idx_rt - module_aot->import_global_count]
-                .type;
+                .type.val_type;
     }
 
     data = inst_aot->global_data + data_offset;
@@ -3625,15 +3810,15 @@ wasm_global_new_internal(wasm_store_t *store, uint16 global_idx_rt,
         if (global_idx_rt < module_aot->import_global_count) {
             AOTImportGlobal *global_import_aot =
                 module_aot->import_globals + global_idx_rt;
-            val_type_rt = global_import_aot->type;
-            is_mutable = global_import_aot->is_mutable;
+            val_type_rt = global_import_aot->type.val_type;
+            is_mutable = global_import_aot->type.is_mutable;
         }
         else {
             AOTGlobal *global_aot =
                 module_aot->globals
                 + (global_idx_rt - module_aot->import_global_count);
-            val_type_rt = global_aot->type;
-            is_mutable = global_aot->is_mutable;
+            val_type_rt = global_aot->type.val_type;
+            is_mutable = global_aot->type.is_mutable;
         }
     }
 #endif
@@ -3715,6 +3900,9 @@ wasm_table_new_internal(wasm_store_t *store, uint16 table_idx_rt,
 {
     wasm_table_t *table = NULL;
     uint8 val_type_rt = 0;
+#if WASM_ENABLE_GC != 0
+    WASMRefType *val_ref_type_rt;
+#endif
     uint32 init_size = 0, max_size = 0;
 
     bh_assert(singleton_engine);
@@ -3730,14 +3918,21 @@ wasm_table_new_internal(wasm_store_t *store, uint16 table_idx_rt,
     table->store = store;
     table->kind = WASM_EXTERN_TABLE;
 
-    if (!wasm_runtime_get_table_inst_elem_type(
-            inst_comm_rt, table_idx_rt, &val_type_rt, &init_size, &max_size)) {
+    if (!wasm_runtime_get_table_inst_elem_type(inst_comm_rt, table_idx_rt,
+                                               &val_type_rt,
+#if WASM_ENABLE_GC != 0
+                                               &val_ref_type_rt,
+#endif
+                                               &init_size, &max_size)) {
         /*
          * a wrong combination of module filetype and compilation flags
          * leads to below branch
          */
         goto failed;
     }
+#if WASM_ENABLE_GC != 0
+    (void)val_ref_type_rt; /* TODO */
+#endif
 
     if (!(table->type =
               wasm_tabletype_new_internal(val_type_rt, init_size, max_size))) {
@@ -3807,6 +4002,7 @@ wasm_table_type(const wasm_table_t *table)
     return wasm_tabletype_copy(table->type);
 }
 
+#if WASM_ENABLE_GC == 0
 own wasm_ref_t *
 wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
 {
@@ -3824,7 +4020,7 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
         if (index >= table_interp->cur_size) {
             return NULL;
         }
-        ref_idx = table_interp->elems[index];
+        ref_idx = (uint32)table_interp->elems[index];
     }
 #endif
 
@@ -3835,7 +4031,7 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
         if (index >= table_aot->cur_size) {
             return NULL;
         }
-        ref_idx = table_aot->elems[index];
+        ref_idx = (uint32)table_aot->elems[index];
     }
 #endif
 
@@ -3848,7 +4044,7 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
     }
 
 #if WASM_ENABLE_REF_TYPES != 0
-    if (table->type->val_type->kind == WASM_ANYREF) {
+    if (table->type->val_type->kind == WASM_EXTERNREF) {
         void *externref_obj;
         if (!wasm_externref_ref2obj(ref_idx, &externref_obj)) {
             return NULL;
@@ -3878,7 +4074,7 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
     if (ref
 #if WASM_ENABLE_REF_TYPES != 0
         && !(WASM_REF_foreign == ref->kind
-             && WASM_ANYREF == table->type->val_type->kind)
+             && WASM_EXTERNREF == table->type->val_type->kind)
 #endif
         && !(WASM_REF_func == ref->kind
              && WASM_FUNCREF == table->type->val_type->kind)) {
@@ -3895,7 +4091,7 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
             return false;
         }
 
-        p_ref_idx = table_interp->elems + index;
+        p_ref_idx = (uint32 *)(table_interp->elems + index);
         function_count =
             ((WASMModuleInstance *)table->inst_comm_rt)->e->function_count;
     }
@@ -3911,7 +4107,7 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
             return false;
         }
 
-        p_ref_idx = table_aot->elems + index;
+        p_ref_idx = (uint32 *)(table_aot->elems + index);
         function_count = module_aot->func_count;
     }
 #endif
@@ -3925,7 +4121,7 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
     }
 
 #if WASM_ENABLE_REF_TYPES != 0
-    if (table->type->val_type->kind == WASM_ANYREF) {
+    if (table->type->val_type->kind == WASM_EXTERNREF) {
         return wasm_externref_obj2ref(table->inst_comm_rt, ref, p_ref_idx);
     }
     else
@@ -3947,6 +4143,22 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
 
     return true;
 }
+#else  /* else of WASM_ENABLE_GC == 0 */
+own wasm_ref_t *
+wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
+{
+    /* TODO */
+    return NULL;
+}
+
+bool
+wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
+               own wasm_ref_t *ref)
+{
+    /* TODO */
+    return false;
+}
+#endif /* end of WASM_ENABLE_GC == 0 */
 
 wasm_table_size_t
 wasm_table_size(const wasm_table_t *table)
@@ -3972,13 +4184,13 @@ wasm_table_size(const wasm_table_t *table)
         if (table->table_idx_rt < module_aot->import_table_count) {
             AOTImportTable *table_aot =
                 module_aot->import_tables + table->table_idx_rt;
-            return table_aot->table_init_size;
+            return table_aot->table_type.init_size;
         }
         else {
             AOTTable *table_aot =
                 module_aot->tables
                 + (table->table_idx_rt - module_aot->import_table_count);
-            return table_aot->table_init_size;
+            return table_aot->table_type.init_size;
         }
     }
 #endif
@@ -4085,12 +4297,12 @@ wasm_memory_new_internal(wasm_store_t *store, uint16 memory_idx_rt,
         AOTModule *module_aot = (AOTModule *)inst_aot->module;
 
         if (memory_idx_rt < module_aot->import_memory_count) {
-            min_pages = module_aot->import_memories->mem_init_page_count;
-            max_pages = module_aot->import_memories->mem_max_page_count;
+            min_pages = module_aot->import_memories->mem_type.init_page_count;
+            max_pages = module_aot->import_memories->mem_type.max_page_count;
         }
         else {
-            min_pages = module_aot->memories->mem_init_page_count;
-            max_pages = module_aot->memories->mem_max_page_count;
+            min_pages = module_aot->memories->init_page_count;
+            max_pages = module_aot->memories->max_page_count;
         }
         init_flag = true;
     }
@@ -4194,7 +4406,8 @@ wasm_memory_data_size(const wasm_memory_t *memory)
             (WASMModuleInstance *)module_inst_comm;
         WASMMemoryInstance *memory_inst =
             module_inst->memories[memory->memory_idx_rt];
-        return memory_inst->cur_page_count * memory_inst->num_bytes_per_page;
+        return (size_t)memory_inst->cur_page_count
+               * memory_inst->num_bytes_per_page;
     }
 #endif
 
@@ -4204,7 +4417,8 @@ wasm_memory_data_size(const wasm_memory_t *memory)
         AOTMemoryInstance *memory_inst =
             ((AOTMemoryInstance **)
                  module_inst->memories)[memory->memory_idx_rt];
-        return memory_inst->cur_page_count * memory_inst->num_bytes_per_page;
+        return (size_t)memory_inst->cur_page_count
+               * memory_inst->num_bytes_per_page;
     }
 #endif
 
@@ -4275,6 +4489,11 @@ interp_link_func(const wasm_instance_t *inst, const WASMModule *module_interp,
 
     imported_func_interp = module_interp->import_functions + func_idx_rt;
     bh_assert(imported_func_interp);
+    bh_assert(imported_func_interp->kind == IMPORT_KIND_FUNC);
+
+    /* it is a placeholder and let's skip it*/
+    if (!import->type)
+        return true;
 
     /* type comparison */
     if (!wasm_functype_same_internal(
@@ -4289,8 +4508,11 @@ interp_link_func(const wasm_instance_t *inst, const WASMModule *module_interp,
         imported_func_interp->u.function.func_ptr_linked = import->u.cb_env.cb;
     else
         imported_func_interp->u.function.func_ptr_linked = import->u.cb;
+    bh_assert(imported_func_interp->u.function.func_ptr_linked);
+
     import->func_idx_rt = func_idx_rt;
 
+    (void)inst;
     return true;
 }
 
@@ -4306,12 +4528,20 @@ interp_link_global(const WASMModule *module_interp, uint16 global_idx_rt,
 
     imported_global_interp = module_interp->import_globals + global_idx_rt;
     bh_assert(imported_global_interp);
+    bh_assert(imported_global_interp->kind == IMPORT_KIND_GLOBAL);
 
-    if (!cmp_val_kind_with_val_type(wasm_valtype_kind(import->type->val_type),
-                                    imported_global_interp->u.global.type))
+    /* it is a placeholder and let's skip it*/
+    if (!import->type)
+        return true;
+
+    /* type comparison */
+    if (!cmp_val_kind_with_val_type(
+            wasm_valtype_kind(import->type->val_type),
+            imported_global_interp->u.global.type.val_type))
         return false;
 
     /* set init value */
+    bh_assert(import->init);
     switch (wasm_valtype_kind(import->type->val_type)) {
         case WASM_I32:
             imported_global_interp->u.global.global_data_linked.i32 =
@@ -4336,58 +4566,6 @@ interp_link_global(const WASMModule *module_interp, uint16 global_idx_rt,
     import->global_idx_rt = global_idx_rt;
     imported_global_interp->u.global.is_linked = true;
     return true;
-}
-
-static uint32
-interp_link(const wasm_instance_t *inst, const WASMModule *module_interp,
-            wasm_extern_t *imports[])
-{
-    uint32 i = 0;
-    uint32 import_func_i = 0;
-    uint32 import_global_i = 0;
-
-    bh_assert(inst && module_interp && imports);
-
-    for (i = 0; i < module_interp->import_count; ++i) {
-        wasm_extern_t *import = imports[i];
-        WASMImport *import_rt = module_interp->imports + i;
-
-        switch (import_rt->kind) {
-            case IMPORT_KIND_FUNC:
-            {
-                if (!interp_link_func(inst, module_interp, import_func_i,
-                                      wasm_extern_as_func(import))) {
-                    LOG_WARNING("link #%d function failed", import_func_i);
-                    goto failed;
-                }
-                import_func_i++;
-                break;
-            }
-            case IMPORT_KIND_GLOBAL:
-            {
-                if (!interp_link_global(module_interp, import_global_i,
-                                        wasm_extern_as_global(import))) {
-                    LOG_WARNING("link #%d global failed", import_global_i);
-                    goto failed;
-                }
-                import_global_i++;
-                break;
-            }
-            case IMPORT_KIND_MEMORY:
-            case IMPORT_KIND_TABLE:
-            default:
-                ASSERT_NOT_IMPLEMENTED();
-                LOG_WARNING("%s meets unsupported kind: %d", __FUNCTION__,
-                            import_rt->kind);
-                goto failed;
-        }
-    }
-
-    return i;
-
-failed:
-    LOG_DEBUG("%s failed", __FUNCTION__);
-    return (uint32)-1;
 }
 
 static bool
@@ -4489,6 +4667,10 @@ aot_link_func(const wasm_instance_t *inst, const AOTModule *module_aot,
     import_aot_func = module_aot->import_funcs + import_func_idx_rt;
     bh_assert(import_aot_func);
 
+    /* it is a placeholder and let's skip it*/
+    if (!import->type)
+        return true;
+
     /* type comparison */
     if (!wasm_functype_same_internal(import->type, import_aot_func->func_type))
         return false;
@@ -4501,6 +4683,8 @@ aot_link_func(const wasm_instance_t *inst, const AOTModule *module_aot,
         import_aot_func->func_ptr_linked = import->u.cb_env.cb;
     else
         import_aot_func->func_ptr_linked = import->u.cb;
+    bh_assert(import_aot_func->func_ptr_linked);
+
     import->func_idx_rt = import_func_idx_rt;
 
     return true;
@@ -4518,13 +4702,18 @@ aot_link_global(const AOTModule *module_aot, uint16 global_idx_rt,
     import_aot_global = module_aot->import_globals + global_idx_rt;
     bh_assert(import_aot_global);
 
+    /* it is a placeholder and let's skip it*/
+    if (!import->type)
+        return true;
+
     val_type = wasm_globaltype_content(import->type);
     bh_assert(val_type);
 
     if (!cmp_val_kind_with_val_type(wasm_valtype_kind(val_type),
-                                    import_aot_global->type))
+                                    import_aot_global->type.val_type))
         return false;
 
+    bh_assert(import->init);
     switch (wasm_valtype_kind(val_type)) {
         case WASM_I32:
             import_aot_global->global_data_linked.i32 = import->init->of.i32;
@@ -4543,66 +4732,11 @@ aot_link_global(const AOTModule *module_aot, uint16 global_idx_rt,
     }
 
     import->global_idx_rt = global_idx_rt;
+    import_aot_global->is_linked = true;
     return true;
-
 failed:
     LOG_DEBUG("%s failed", __FUNCTION__);
     return false;
-}
-
-static uint32
-aot_link(const wasm_instance_t *inst, const AOTModule *module_aot,
-         wasm_extern_t *imports[])
-{
-    uint32 i = 0;
-    uint32 import_func_i = 0;
-    uint32 import_global_i = 0;
-    wasm_extern_t *import = NULL;
-    wasm_func_t *func = NULL;
-    wasm_global_t *global = NULL;
-
-    bh_assert(inst && module_aot && imports);
-
-    while (import_func_i < module_aot->import_func_count
-           || import_global_i < module_aot->import_global_count) {
-        import = imports[i++];
-
-        bh_assert(import);
-
-        switch (wasm_extern_kind(import)) {
-            case WASM_EXTERN_FUNC:
-                bh_assert(import_func_i < module_aot->import_func_count);
-                func = wasm_extern_as_func((wasm_extern_t *)import);
-                if (!aot_link_func(inst, module_aot, import_func_i, func)) {
-                    LOG_WARNING("link #%d function failed", import_func_i);
-                    goto failed;
-                }
-                import_func_i++;
-
-                break;
-            case WASM_EXTERN_GLOBAL:
-                bh_assert(import_global_i < module_aot->import_global_count);
-                global = wasm_extern_as_global((wasm_extern_t *)import);
-                if (!aot_link_global(module_aot, import_global_i, global)) {
-                    LOG_WARNING("link #%d global failed", import_global_i);
-                    goto failed;
-                }
-                import_global_i++;
-
-                break;
-            case WASM_EXTERN_MEMORY:
-            case WASM_EXTERN_TABLE:
-            default:
-                ASSERT_NOT_IMPLEMENTED();
-                goto failed;
-        }
-    }
-
-    return i;
-
-failed:
-    LOG_DEBUG("%s failed", __FUNCTION__);
-    return (uint32)-1;
 }
 
 static bool
@@ -4680,7 +4814,7 @@ aot_process_export(wasm_store_t *store, const AOTModuleInstance *inst_aot,
             goto failed;
         }
 
-        wasm_name_new_from_string(external->name, export->name);
+        wasm_name_new_from_string_nt(external->name, export->name);
         if (strlen(export->name) && !external->name->data) {
             goto failed;
         }
@@ -4698,6 +4832,95 @@ failed:
 }
 #endif /* WASM_ENABLE_AOT */
 
+static bool
+do_link(const wasm_instance_t *inst, const wasm_module_t *module,
+        const wasm_extern_vec_t *imports)
+{
+    uint32 i, import_func_i, import_global_i;
+
+    bh_assert(inst && module);
+
+    /* we have run a module_type check before. */
+
+    for (i = 0, import_func_i = 0, import_global_i = 0; i < imports->num_elems;
+         i++) {
+        wasm_extern_t *import = imports->data[i];
+
+        if (!import) {
+            LOG_ERROR("imports[%d] is NULL and it is fatal\n", i);
+            goto failed;
+        }
+
+        switch (wasm_extern_kind(import)) {
+            case WASM_EXTERN_FUNC:
+            {
+                bool ret = false;
+#if WASM_ENABLE_INTERP != 0
+                if ((*module)->module_type == Wasm_Module_Bytecode) {
+                    ret = interp_link_func(inst, MODULE_INTERP(module),
+                                           import_func_i,
+                                           wasm_extern_as_func(import));
+                }
+#endif
+#if WASM_ENABLE_AOT != 0
+                if ((*module)->module_type == Wasm_Module_AoT) {
+                    ret = aot_link_func(inst, MODULE_AOT(module), import_func_i,
+                                        wasm_extern_as_func(import));
+                }
+#endif
+                if (!ret) {
+                    LOG_WARNING("link function  #%d failed", import_func_i);
+                    goto failed;
+                }
+
+                import_func_i++;
+                break;
+            }
+            case WASM_EXTERN_GLOBAL:
+            {
+                bool ret = false;
+#if WASM_ENABLE_INTERP != 0
+                if ((*module)->module_type == Wasm_Module_Bytecode) {
+                    ret = interp_link_global(MODULE_INTERP(module),
+                                             import_global_i,
+                                             wasm_extern_as_global(import));
+                }
+#endif
+#if WASM_ENABLE_AOT != 0
+                if ((*module)->module_type == Wasm_Module_AoT) {
+                    ret = aot_link_global(MODULE_AOT(module), import_global_i,
+                                          wasm_extern_as_global(import));
+                }
+#endif
+                if (!ret) {
+                    LOG_WARNING("link global #%d failed", import_global_i);
+                    goto failed;
+                }
+
+                import_global_i++;
+                break;
+            }
+            case WASM_EXTERN_MEMORY:
+            case WASM_EXTERN_TABLE:
+            {
+                LOG_WARNING("doesn't support import memories and tables for "
+                            "now, ignore them");
+                break;
+            }
+            default:
+            {
+                UNREACHABLE();
+                break;
+            }
+        }
+    }
+
+    return true;
+failed:
+    LOG_DEBUG("%s failed", __FUNCTION__);
+    return false;
+}
+
 wasm_instance_t *
 wasm_instance_new(wasm_store_t *store, const wasm_module_t *module,
                   const wasm_extern_vec_t *imports, own wasm_trap_t **trap)
@@ -4712,21 +4935,35 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
                             own wasm_trap_t **trap, const uint32 stack_size,
                             const uint32 heap_size)
 {
+    InstantiationArgs inst_args = { 0 };
+    inst_args.default_stack_size = stack_size;
+    inst_args.host_managed_heap_size = heap_size;
+    return wasm_instance_new_with_args_ex(store, module, imports, trap,
+                                          &inst_args);
+}
+
+wasm_instance_t *
+wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
+                               const wasm_extern_vec_t *imports,
+                               own wasm_trap_t **trap,
+                               const InstantiationArgs *inst_args)
+{
     char sub_error_buf[128] = { 0 };
     char error_buf[256] = { 0 };
-    bool import_count_verified = false;
     wasm_instance_t *instance = NULL;
-    WASMModuleInstance *inst_rt;
     CApiFuncImport *func_import = NULL, **p_func_imports = NULL;
-    uint32 i = 0, import_count = 0, import_func_count = 0;
+    uint32 i = 0, import_func_count = 0;
     uint64 total_size;
-    bool processed = false;
+    bool build_exported = false;
 
     bh_assert(singleton_engine);
 
-    if (!module) {
+    if (!module)
         return NULL;
-    }
+
+    /*
+     * will do the check at the end of wasm_runtime_instantiate
+     */
 
     WASM_C_DUMP_PROC_MEM();
 
@@ -4737,61 +4974,20 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
         goto failed;
     }
 
-    /* link module and imports */
-    if (imports && imports->num_elems) {
-#if WASM_ENABLE_INTERP != 0
-        if ((*module)->module_type == Wasm_Module_Bytecode) {
-            import_count = MODULE_INTERP(module)->import_count;
-
-            if (import_count) {
-                uint32 actual_link_import_count =
-                    interp_link(instance, MODULE_INTERP(module),
-                                (wasm_extern_t **)imports->data);
-                /* make sure a complete import list */
-                if ((int32)import_count < 0
-                    || import_count != actual_link_import_count) {
-                    snprintf(sub_error_buf, sizeof(sub_error_buf),
-                             "Failed to validate imports");
-                    goto failed;
-                }
-            }
-            import_count_verified = true;
-        }
-#endif
-
-#if WASM_ENABLE_AOT != 0
-        if ((*module)->module_type == Wasm_Module_AoT) {
-            import_count = MODULE_AOT(module)->import_func_count
-                           + MODULE_AOT(module)->import_global_count
-                           + MODULE_AOT(module)->import_memory_count
-                           + MODULE_AOT(module)->import_table_count;
-
-            if (import_count) {
-                import_count = aot_link(instance, MODULE_AOT(module),
-                                        (wasm_extern_t **)imports->data);
-                if ((int32)import_count < 0) {
-                    snprintf(sub_error_buf, sizeof(sub_error_buf),
-                             "Failed to validate imports");
-                    goto failed;
-                }
-            }
-            import_count_verified = true;
-        }
-#endif
-
-        /*
-         * a wrong combination of module filetype and compilation flags
-         * also leads to below branch
-         */
-        if (!import_count_verified) {
+    /* executes the instantiate-time linking if provided */
+    if (imports) {
+        if (!do_link(instance, module, imports)) {
             snprintf(sub_error_buf, sizeof(sub_error_buf),
-                     "Failed to verify import count");
+                     "Failed to validate imports");
             goto failed;
         }
     }
+    /*
+     * will do the linking result check at the end of wasm_runtime_instantiate
+     */
 
-    instance->inst_comm_rt = wasm_runtime_instantiate(
-        *module, stack_size, heap_size, sub_error_buf, sizeof(sub_error_buf));
+    instance->inst_comm_rt = wasm_runtime_instantiate_ex(
+        *module, inst_args, sub_error_buf, sizeof(sub_error_buf));
     if (!instance->inst_comm_rt) {
         goto failed;
     }
@@ -4802,23 +4998,25 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
         goto failed;
     }
 
-    inst_rt = (WASMModuleInstance *)instance->inst_comm_rt;
+    /* create the c-api func import list */
 #if WASM_ENABLE_INTERP != 0
     if (instance->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
-        p_func_imports = &inst_rt->e->c_api_func_imports;
-        import_func_count = inst_rt->module->import_function_count;
+        WASMModuleInstance *wasm_module_inst =
+            (WASMModuleInstance *)instance->inst_comm_rt;
+        p_func_imports = &(wasm_module_inst->c_api_func_imports);
+        import_func_count = MODULE_INTERP(module)->import_function_count;
     }
 #endif
 #if WASM_ENABLE_AOT != 0
     if (instance->inst_comm_rt->module_type == Wasm_Module_AoT) {
-        p_func_imports =
-            &((AOTModuleInstanceExtra *)inst_rt->e)->c_api_func_imports;
-        import_func_count = ((AOTModule *)inst_rt->module)->import_func_count;
+        AOTModuleInstance *aot_module_inst =
+            (AOTModuleInstance *)instance->inst_comm_rt;
+        p_func_imports = &(aot_module_inst->c_api_func_imports);
+        import_func_count = MODULE_AOT(module)->import_func_count;
     }
 #endif
     bh_assert(p_func_imports);
 
-    /* create the c-api func import list */
     total_size = (uint64)sizeof(CApiFuncImport) * import_func_count;
     if (total_size > 0
         && !(*p_func_imports = func_import = malloc_internal(total_size))) {
@@ -4827,16 +5025,21 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
         goto failed;
     }
 
-    /* fill in c-api func import list */
-    for (i = 0; i < import_count; i++) {
-        wasm_func_t *func_host;
-        wasm_extern_t *in;
+    /* fill in module_inst->c_api_func_imports */
+    for (i = 0; imports && i < imports->num_elems; i++) {
+        wasm_func_t *func_host = NULL;
+        wasm_extern_t *in = imports->data[i];
+        bh_assert(in);
 
-        in = imports->data[i];
         if (wasm_extern_kind(in) != WASM_EXTERN_FUNC)
             continue;
 
         func_host = wasm_extern_as_func(in);
+        /* it is a placeholder and let's skip it*/
+        if (!func_host->type) {
+            func_import++;
+            continue;
+        }
 
         func_import->with_env_arg = func_host->with_env;
         if (func_host->with_env) {
@@ -4847,14 +5050,16 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
             func_import->func_ptr_linked = func_host->u.cb;
             func_import->env_arg = NULL;
         }
+        bh_assert(func_import->func_ptr_linked);
 
         func_import++;
     }
-    bh_assert((uint32)(func_import - *p_func_imports) == import_func_count);
 
     /* fill with inst */
-    for (i = 0; imports && imports->data && i < (uint32)import_count; ++i) {
+    for (i = 0; imports && imports->data && i < imports->num_elems; ++i) {
         wasm_extern_t *import = imports->data[i];
+        bh_assert(import);
+
         switch (import->kind) {
             case WASM_EXTERN_FUNC:
                 wasm_extern_as_func(import)->inst_comm_rt =
@@ -4896,7 +5101,7 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
             goto failed;
         }
 
-        processed = true;
+        build_exported = true;
     }
 #endif
 
@@ -4920,7 +5125,7 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
             goto failed;
         }
 
-        processed = true;
+        build_exported = true;
     }
 #endif
 
@@ -4928,7 +5133,7 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
      * a wrong combination of module filetype and compilation flags
      * leads to below branch
      */
-    if (!processed) {
+    if (!build_exported) {
         snprintf(sub_error_buf, sizeof(sub_error_buf),
                  "Incorrect filetype and compilation flags");
         goto failed;
@@ -4950,11 +5155,11 @@ failed:
              sub_error_buf);
     if (trap != NULL) {
         wasm_message_t message = { 0 };
-        wasm_name_new_from_string(&message, error_buf);
+        wasm_name_new_from_string_nt(&message, error_buf);
         *trap = wasm_trap_new(store, &message);
         wasm_byte_vec_delete(&message);
     }
-    LOG_DEBUG(error_buf);
+    LOG_DEBUG("%s", error_buf);
     wasm_instance_delete_internal(instance);
     return NULL;
 }
@@ -5073,7 +5278,7 @@ wasm_externkind_t
 wasm_extern_kind(const wasm_extern_t *external)
 {
     if (!external) {
-        return WASM_ANYREF;
+        return WASM_EXTERNREF;
     }
 
     return external->kind;
@@ -5150,3 +5355,37 @@ BASIC_FOUR_LIST(WASM_EXTERN_AS_OTHER_CONST)
 
 BASIC_FOUR_LIST(WASM_OTHER_AS_EXTERN_CONST)
 #undef WASM_OTHER_AS_EXTERN_CONST
+
+wasm_extern_t *
+wasm_extern_new_empty(wasm_store_t *store, wasm_externkind_t extern_kind)
+{
+    if (extern_kind == WASM_EXTERN_FUNC)
+        return wasm_func_as_extern(wasm_func_new_empty(store));
+
+    if (extern_kind == WASM_EXTERN_GLOBAL)
+        return wasm_global_as_extern(wasm_global_new_empty(store));
+
+    LOG_ERROR("Don't support linking table and memory for now");
+    return NULL;
+}
+
+double
+wasm_instance_sum_wasm_exec_time(const wasm_instance_t *instance)
+{
+#if WASM_ENABLE_PERF_PROFILING != 0
+    return wasm_runtime_sum_wasm_exec_time(instance->inst_comm_rt);
+#else
+    return -1.0;
+#endif
+}
+
+double
+wasm_instance_get_wasm_func_exec_time(const wasm_instance_t *instance,
+                                      const char *name)
+{
+#if WASM_ENABLE_PERF_PROFILING != 0
+    return wasm_runtime_get_wasm_func_exec_time(instance->inst_comm_rt, name);
+#else
+    return -1.0;
+#endif
+}

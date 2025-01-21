@@ -3,8 +3,6 @@
 
 cmake_minimum_required (VERSION 3.21)
 
-set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mfloat-abi=hard")
-
 project (iwasm)
 
 set (WAMR_BUILD_PLATFORM "darwin")
@@ -41,7 +39,7 @@ if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif ()
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 
 if (NOT DEFINED WAMR_BUILD_INTERP)
   # Enable Interpreter by default

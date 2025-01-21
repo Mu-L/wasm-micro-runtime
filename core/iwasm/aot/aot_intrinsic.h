@@ -60,6 +60,9 @@ extern "C" {
 #define AOT_INTRINSIC_FLAG_F32_CONST    AOT_INTRINSIC_FLAG(0, 26)
 #define AOT_INTRINSIC_FLAG_I32_CONST    AOT_INTRINSIC_FLAG(0, 27)
 #define AOT_INTRINSIC_FLAG_I32_DIV_U    AOT_INTRINSIC_FLAG(0, 28)
+#define AOT_INTRINSIC_FLAG_I32_REM_S    AOT_INTRINSIC_FLAG(0, 29)
+#define AOT_INTRINSIC_FLAG_I32_REM_U    AOT_INTRINSIC_FLAG(0, 30)
+#define AOT_INTRINSIC_FLAG_I32_DIV_S    AOT_INTRINSIC_FLAG(0, 31)
 
 #define AOT_INTRINSIC_FLAG_F64_FADD     AOT_INTRINSIC_FLAG(1, 0)
 #define AOT_INTRINSIC_FLAG_F64_FSUB     AOT_INTRINSIC_FLAG(1, 1)
@@ -257,8 +260,17 @@ aot_intrinsic_f64_cmp(AOTFloatCond cond, float64 lhs, float64 rhs);
 int64
 aot_intrinsic_i64_div_s(int64 l, int64 r);
 
+int32
+aot_intrinsic_i32_div_s(int32 l, int32 r);
+
 uint32
 aot_intrinsic_i32_div_u(uint32 l, uint32 r);
+
+int32
+aot_intrinsic_i32_rem_s(int32 l, int32 r);
+
+uint32
+aot_intrinsic_i32_rem_u(uint32 l, uint32 r);
 
 uint64
 aot_intrinsic_i64_div_u(uint64 l, uint64 r);
@@ -275,10 +287,10 @@ aot_intrinsic_i64_bit_or(uint64 l, uint64 r);
 uint64
 aot_intrinsic_i64_bit_and(uint64 l, uint64 r);
 
+#if WASM_ENABLE_WAMR_COMPILER != 0 || WASM_ENABLE_JIT != 0
 const char *
 aot_intrinsic_get_symbol(const char *llvm_intrinsic);
 
-#if WASM_ENABLE_WAMR_COMPILER != 0 || WASM_ENABLE_JIT != 0
 bool
 aot_intrinsic_check_capability(const AOTCompContext *comp_ctx,
                                const char *llvm_intrinsic);

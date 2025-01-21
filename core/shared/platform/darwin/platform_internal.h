@@ -58,6 +58,7 @@ typedef pthread_t korp_tid;
 typedef pthread_mutex_t korp_mutex;
 typedef pthread_cond_t korp_cond;
 typedef pthread_t korp_thread;
+typedef pthread_rwlock_t korp_rwlock;
 typedef sem_t korp_sem;
 
 #define OS_THREAD_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
@@ -81,8 +82,6 @@ typedef jmp_buf korp_jmpbuf;
 #define os_longjmp longjmp
 #define os_alloca alloca
 
-#define os_getpagesize getpagesize
-
 typedef void (*os_signal_handler)(void *sig_addr);
 
 int
@@ -101,6 +100,24 @@ void
 os_sigreturn();
 #endif /* end of BUILD_TARGET_X86_64/AMD_64/AARCH64/RISCV64 */
 #endif /* end of WASM_DISABLE_HW_BOUND_CHECK */
+
+#define os_getpagesize getpagesize
+
+#if WASM_DISABLE_WAKEUP_BLOCKING_OP == 0
+#define OS_ENABLE_WAKEUP_BLOCKING_OP
+#endif
+void
+os_set_signal_number_for_blocking_op(int signo);
+
+typedef int os_file_handle;
+typedef DIR *os_dir_stream;
+typedef int os_raw_file_handle;
+
+static inline os_file_handle
+os_get_invalid_handle(void)
+{
+    return -1;
+}
 
 #ifdef __cplusplus
 }

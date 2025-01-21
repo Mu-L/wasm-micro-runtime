@@ -9,14 +9,13 @@ if (NOT WAMR_BUILD_PLATFORM STREQUAL "windows")
   project(c-api)
 else()
   project (c-api C ASM)
-  enable_language (ASM_MASM)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 ################  runtime settings  ################
 
 string (TOLOWER ${CMAKE_HOST_SYSTEM_NAME} WAMR_BUILD_PLATFORM)
@@ -24,7 +23,7 @@ if (APPLE)
   add_definitions(-DBH_PLATFORM_DARWIN)
 endif ()
 
-# Resetdefault linker flags
+# Reset default linker flags
 set(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
 set(CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "")
 
@@ -36,11 +35,17 @@ set(CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "")
 if (NOT DEFINED WAMR_BUILD_TARGET)
   if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)")
     set (WAMR_BUILD_TARGET "AARCH64")
+    if (NOT DEFINED WAMR_BUILD_SIMD)
+      set (WAMR_BUILD_SIMD 1)
+    endif ()
   elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
     set (WAMR_BUILD_TARGET "RISCV64")
   elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
     # Build as X86_64 by default in 64-bit platform
     set (WAMR_BUILD_TARGET "X86_64")
+    if (NOT DEFINED WAMR_BUILD_SIMD)
+      set (WAMR_BUILD_SIMD 1)
+    endif ()
   elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
     # Build as X86_32 by default in 32-bit platform
     set (WAMR_BUILD_TARGET "X86_32")
@@ -66,6 +71,11 @@ set(WAMR_BUILD_LIBC_WASI 0)
 set(WAMR_BUILD_MULTI_MODULE 1)
 set(WAMR_BUILD_DUMP_CALL_STACK 1)
 set(WAMR_BUILD_REF_TYPES 1)
+
+# If not defined WAMR_BUILD_GC, set it to 0
+if(NOT DEFINED WAMRC_BUILD_WITH_GC)
+  set(WAMRC_BUILD_WITH_GC 0)
+endif()
 
 if(NOT DEFINED WAMR_BUILD_FAST_INTERP)
   set(WAMR_BUILD_FAST_INTERP 1)
@@ -94,7 +104,7 @@ endif()
 target_link_libraries (vmlib ${LLVM_AVAILABLE_LIBS} ${UV_A_LIBS} -lm -ldl -lpthread)
 
 if (WAMR_BUILD_WASM_CACHE EQUAL 1)
-  target_link_libraries(vmlib OpenSSL::SSL)
+  target_link_libraries(vmlib boringssl_crypto)
 endif ()
 ################################################
 
@@ -136,28 +146,18 @@ include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 
 set(MM_UTIL src/utils/multi_module_utils.c)
 # build executable for each .c
-set(EXAMPLES
-  callback
-  callback_chain
-  clone
-  empty_imports
-  global
-  hello
-  hostref
-  memory
-  reflect
-  table
-  threads
-  trap
-)
-
-if(WAMR_BUILD_JIT AND WAMR_BUILD_LAZY_JIT)
-  if((${WAMR_BUILD_JIT} EQUAL 1) AND (${WAMR_BUILD_LAZY_JIT} EQUAL 1))
-    list(APPEND EXAMPLES serialize)
-  endif()
-endif()
+list(APPEND EXAMPLES callback callback_chain empty_imports global hello hostref memory reflect table trap)
+# FIXME enable both in the future
+#list(APPEND EXAMPLES clone threads)
+# FIXME
+# if(WAMR_BUILD_JIT EQUAL 1 AND WAMR_BUILD_LAZY_JIT EQUAL 0)
+#     list(APPEND EXAMPLES serialize)
+# endif()
 
 check_pie_supported()
+
+include(CTest)
+enable_testing()
 
 foreach(EX ${EXAMPLES})
   set(SRC ${CMAKE_CURRENT_LIST_DIR}/src/${EX}.c)
@@ -165,7 +165,7 @@ foreach(EX ${EXAMPLES})
   add_executable(${EX} ${SRC} ${UNCOMMON_SHARED_SOURCE} ${MM_UTIL})
   set_target_properties (${EX} PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(${EX} PRIVATE ${UNCOMMON_SHARED_DIR})
-  target_link_libraries(${EX} vmlib -lpthread -lm)
+  target_link_libraries(${EX} vmlib)
   if (MSVC)
     target_compile_definitions(${EX} PRIVATE WASM_API_EXTERN=)
   endif()
@@ -183,8 +183,13 @@ foreach(EX ${EXAMPLES})
 
   # generate .aot file
   if(${WAMR_BUILD_AOT} EQUAL 1)
+    if(${WAMRC_BUILD_WITH_GC} EQUAL 1)
+      set(WAMRC_GC_FLAGS "--enable-gc")
+    else()
+      set(WAMRC_GC_FLAGS "")
+    endif()
     add_custom_target(${EX}_AOT
-      COMMAND ${WAMRC} -o ${PROJECT_BINARY_DIR}/${EX}.aot
+      COMMAND ${WAMRC} ${WAMRC_GC_FLAGS} -o ${PROJECT_BINARY_DIR}/${EX}.aot
         ${PROJECT_BINARY_DIR}/${EX}.wasm
       DEPENDS ${EX}_WASM
       BYPRODUCTS ${PROJECT_BINARY_DIR}/${EX}.aot
@@ -193,6 +198,12 @@ foreach(EX ${EXAMPLES})
     )
     add_dependencies(${EX} ${EX}_AOT)
   endif()
+
+  # run `ctest --test-dir build`
+  add_test(NAME Test_${EX}
+    COMMAND ./${EX}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+  )
 endforeach()
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -201,19 +212,5 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     REQUIRED
   )
 
-  if(VALGRIND)
-    foreach(EX ${EXAMPLES})
-      add_custom_command(
-        OUTPUT ${EX}_leak_check.report
-        DEPENDS ${EX} ${EX}_WASM
-        COMMAND ${VALGRIND} --tool=memcheck --leak-check=summary  -- ./${EX} > ${EX}_leak_check.report 2>&1
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-      )
-      add_custom_target(${EX}_LEAK_TEST ALL
-        DEPENDS ${EX}_leak_check.report
-        COMMAND grep "All heap blocks were freed -- no leaks are possible" ${EX}_leak_check.report
-        COMMENT "Please read ${EX}_leak_check.report when meeting Error"
-      )
-    endforeach()
-  endif (VALGRIND)
-endif (CMAKE_BUILD_TYPE STREQUAL "Debug")
+  # run `ctest -T memcheck -V --test-dir build`
+endif()

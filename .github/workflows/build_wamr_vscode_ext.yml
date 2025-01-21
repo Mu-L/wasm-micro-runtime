@@ -14,18 +14,24 @@ on:
         type: string
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v3
+    permissions:
+      contents: write # for uploading release artifacts
 
-      - name: Use Node.js 14.x
-        uses: actions/setup-node@v3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 18.x
+        uses: actions/setup-node@v4
         with:
-          node-version: 14.x
-      
-      - name: set vscode extension to correct version 
+          node-version: 18.x
+
+      - name: set vscode extension to correct version
         run: |
           npm install -g json
           json -I -f package.json -e "this.version=\"${{ inputs.ver_num }}\""
@@ -33,16 +39,23 @@ jobs:
 
       - name: generate wamr ide vscode extension
         run: |
-          npm install -g vsce
+          npm install -g @vscode/vsce
           rm -rf node_modules
           npm install
           vsce package
         working-directory: test-tools/wamr-ide/VSCode-Extension
 
+      - name: publish wamr ide vscode extension to the vsce marketplace
+        if: ${{ github.repository == 'bytecodealliance/wasm-micro-runtime' }}
+        run: |
+          vsce publish -p ${{ secrets.TOKEN }}
+        working-directory: test-tools/wamr-ide/VSCode-Extension
+
       - name: compress the vscode extension
         run: |
-          tar czf wamr_ide-${{ inputs.ver_num }}.tar.gz wamride-*.vsix
-          zip wamr_ide-${{ inputs.ver_num }}.zip wamride-*.vsix
+          mv wamride-*.vsix wamr-ide.vsix
+          tar czf wamr-ide-${{ inputs.ver_num }}.tar.gz wamr-ide.vsix
+          zip wamr-ide-${{ inputs.ver_num }}.zip wamr-ide.vsix
         working-directory: test-tools/wamr-ide/VSCode-Extension
 
       - name: upload release tar.gz
@@ -51,8 +64,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ inputs.upload_url }}
-          asset_path: test-tools/wamr-ide/VSCode-Extension/wamr_ide-${{ inputs.ver_num }}.tar.gz
-          asset_name: wamr_ide-${{ inputs.ver_num }}.tar.gz
+          asset_path: test-tools/wamr-ide/VSCode-Extension/wamr-ide-${{ inputs.ver_num }}.tar.gz
+          asset_name: wamr-ide-${{ inputs.ver_num }}.tar.gz
           asset_content_type: application/x-gzip
 
       - name: upload release zip
@@ -61,6 +74,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ inputs.upload_url }}
-          asset_path: test-tools/wamr-ide/VSCode-Extension/wamr_ide-${{ inputs.ver_num }}.zip
-          asset_name: wamr_ide-${{ inputs.ver_num }}.zip
+          asset_path: test-tools/wamr-ide/VSCode-Extension/wamr-ide-${{ inputs.ver_num }}.zip
+          asset_name: wamr-ide-${{ inputs.ver_num }}.zip
           asset_content_type: application/zip

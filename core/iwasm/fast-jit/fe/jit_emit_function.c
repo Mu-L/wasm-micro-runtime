@@ -5,6 +5,7 @@
 
 #include "jit_emit_function.h"
 #include "jit_emit_exception.h"
+#include "jit_emit_control.h"
 #include "../jit_frontend.h"
 #include "../jit_codegen.h"
 #include "../../interpreter/wasm_runtime.h"
@@ -232,6 +233,12 @@ jit_compile_op_call(JitCompContext *cc, uint32 func_idx, bool tail_call)
     bool is_pointer_arg;
     bool return_value = false;
 
+#if WASM_ENABLE_THREAD_MGR != 0
+    /* Insert suspend check point */
+    if (!jit_check_suspend_flags(cc))
+        goto fail;
+#endif
+
     if (func_idx < wasm_module->import_function_count) {
         /* The function to call is an import function */
         func_import = &wasm_module->import_functions[func_idx].u.function;
@@ -274,6 +281,12 @@ jit_compile_op_call(JitCompContext *cc, uint32 func_idx, bool tail_call)
             if (!post_return(cc, func_type, 0, true)) {
                 goto fail;
             }
+
+#if WASM_ENABLE_THREAD_MGR != 0
+            /* Insert suspend check point */
+            if (!jit_check_suspend_flags(cc))
+                goto fail;
+#endif
 
             return true;
         }
@@ -318,12 +331,14 @@ jit_compile_op_call(JitCompContext *cc, uint32 func_idx, bool tail_call)
                 func_params[1] = NEW_CONST(I32, false); /* is_str = false */
                 func_params[2] = argvs[i];
                 if (signature[i + 2] == '~') {
+                    /* TODO: Memory64 no need to convert if mem idx type i64 */
+                    func_params[3] = jit_cc_new_reg_I64(cc);
                     /* pointer with length followed */
-                    func_params[3] = argvs[i + 1];
+                    GEN_INSN(I32TOI64, func_params[3], argvs[i + 1]);
                 }
                 else {
                     /* pointer with length followed */
-                    func_params[3] = NEW_CONST(I32, 1);
+                    func_params[3] = NEW_CONST(I64, 1);
                 }
             }
             else if (signature[i + 1] == '$') {
@@ -331,10 +346,15 @@ jit_compile_op_call(JitCompContext *cc, uint32 func_idx, bool tail_call)
                 is_pointer_arg = true;
                 func_params[1] = NEW_CONST(I32, true); /* is_str = true */
                 func_params[2] = argvs[i];
-                func_params[3] = NEW_CONST(I32, 1);
+                func_params[3] = NEW_CONST(I64, 1);
             }
 
             if (is_pointer_arg) {
+                JitReg native_addr_64 = jit_cc_new_reg_I64(cc);
+                /* TODO: Memory64 no need to convert if mem idx type i64 */
+                GEN_INSN(I32TOI64, native_addr_64, func_params[2]);
+                func_params[2] = native_addr_64;
+
                 if (!jit_emit_callnative(cc, jit_check_app_addr_and_convert,
                                          ret, func_params, 5)) {
                     goto fail;
@@ -409,12 +429,18 @@ jit_compile_op_call(JitCompContext *cc, uint32 func_idx, bool tail_call)
 
         res = create_first_res_reg(cc, func_type);
 
-        GEN_INSN(CALLBC, res, 0, jitted_code);
+        GEN_INSN(CALLBC, res, 0, jitted_code, NEW_CONST(I32, func_idx));
 
         if (!post_return(cc, func_type, res, true)) {
             goto fail;
         }
     }
+
+#if WASM_ENABLE_THREAD_MGR != 0
+    /* Insert suspend check point */
+    if (!jit_check_suspend_flags(cc))
+        goto fail;
+#endif
 
     /* Clear part of memory regs and table regs as their values
        may be changed in the function call */
@@ -480,7 +506,9 @@ jit_compile_op_call_indirect(JitCompContext *cc, uint32 type_idx,
     if (UINTPTR_MAX == UINT64_MAX) {
         offset_i32 = jit_cc_new_reg_I32(cc);
         offset = jit_cc_new_reg_I64(cc);
-        GEN_INSN(SHL, offset_i32, elem_idx, NEW_CONST(I32, 2));
+        /* Calculate offset by pointer size (elem_idx *
+         * sizeof(table_elem_type_t)) */
+        GEN_INSN(SHL, offset_i32, elem_idx, NEW_CONST(I32, 3));
         GEN_INSN(I32TOI64, offset, offset_i32);
     }
     else {
@@ -539,6 +567,12 @@ jit_compile_op_call_indirect(JitCompContext *cc, uint32 type_idx,
              NEW_CONST(I32, offsetof(WASMExecEnv, jit_cache)));
     GEN_INSN(STI32, func_idx, cc->exec_env_reg,
              NEW_CONST(I32, offsetof(WASMExecEnv, jit_cache) + 4));
+
+#if WASM_ENABLE_THREAD_MGR != 0
+    /* Insert suspend check point */
+    if (!jit_check_suspend_flags(cc))
+        goto fail;
+#endif
 
     block_import = jit_cc_new_basic_block(cc, 0);
     block_nonimport = jit_cc_new_basic_block(cc, 0);
@@ -624,19 +658,19 @@ jit_compile_op_call_indirect(JitCompContext *cc, uint32 type_idx,
                          NEW_CONST(I32, offset_of_local(n)));
                 break;
             case VALUE_TYPE_I64:
-                res = jit_cc_new_reg_I32(cc);
+                res = jit_cc_new_reg_I64(cc);
                 GEN_INSN(LDI64, res, argv, NEW_CONST(I32, 0));
                 GEN_INSN(STI64, res, cc->fp_reg,
                          NEW_CONST(I32, offset_of_local(n)));
                 break;
             case VALUE_TYPE_F32:
-                res = jit_cc_new_reg_I32(cc);
+                res = jit_cc_new_reg_F32(cc);
                 GEN_INSN(LDF32, res, argv, NEW_CONST(I32, 0));
                 GEN_INSN(STF32, res, cc->fp_reg,
                          NEW_CONST(I32, offset_of_local(n)));
                 break;
             case VALUE_TYPE_F64:
-                res = jit_cc_new_reg_I32(cc);
+                res = jit_cc_new_reg_F64(cc);
                 GEN_INSN(LDF64, res, argv, NEW_CONST(I32, 0));
                 GEN_INSN(STF64, res, cc->fp_reg,
                          NEW_CONST(I32, offset_of_local(n)));
@@ -700,7 +734,7 @@ jit_compile_op_call_indirect(JitCompContext *cc, uint32 type_idx,
                 goto fail;
         }
     }
-    GEN_INSN(CALLBC, res, 0, jitted_code);
+    GEN_INSN(CALLBC, res, 0, jitted_code, func_idx);
     /* Store res into current frame, so that post_return in
         block func_return can get the value */
     n = cc->jit_frame->sp - cc->jit_frame->lp;
@@ -741,6 +775,12 @@ jit_compile_op_call_indirect(JitCompContext *cc, uint32 type_idx,
     if (!post_return(cc, func_type, 0, true)) {
         goto fail;
     }
+
+#if WASM_ENABLE_THREAD_MGR != 0
+    /* Insert suspend check point */
+    if (!jit_check_suspend_flags(cc))
+        goto fail;
+#endif
 
     /* Clear part of memory regs and table regs as their values
        may be changed in the function call */
@@ -796,21 +836,43 @@ emit_callnative(JitCompContext *cc, JitReg native_func_reg, JitReg res,
                 JitReg *params, uint32 param_count)
 {
     JitInsn *insn;
+    char *i32_arg_names[] = { "edi", "esi", "edx", "ecx" };
     char *i64_arg_names[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
     char *f32_arg_names[] = { "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5" };
     char *f64_arg_names[] = { "xmm0_f64", "xmm1_f64", "xmm2_f64",
                               "xmm3_f64", "xmm4_f64", "xmm5_f64" };
-    JitReg i64_arg_regs[6], f32_arg_regs[6], f64_arg_regs[6], res_reg = 0;
+    JitReg i32_arg_regs[4], i64_arg_regs[6];
+    JitReg f32_arg_regs[6], f64_arg_regs[6], res_reg = 0;
     JitReg eax_hreg = jit_codegen_get_hreg_by_name("eax");
     JitReg xmm0_hreg = jit_codegen_get_hreg_by_name("xmm0");
-    uint32 i, i64_reg_idx, float_reg_idx;
+    uint32 i, i64_reg_idx, float_reg_idx, lock_i32_reg_num;
 
     bh_assert(param_count <= 6);
+
+    for (i = 0; i < 4; i++) {
+        i32_arg_regs[i] = jit_codegen_get_hreg_by_name(i32_arg_names[i]);
+    }
 
     for (i = 0; i < 6; i++) {
         i64_arg_regs[i] = jit_codegen_get_hreg_by_name(i64_arg_names[i]);
         f32_arg_regs[i] = jit_codegen_get_hreg_by_name(f32_arg_names[i]);
         f64_arg_regs[i] = jit_codegen_get_hreg_by_name(f64_arg_names[i]);
+    }
+
+    lock_i32_reg_num = param_count < 4 ? param_count : 4;
+
+    /*
+     * Lock i32 registers so that they won't be allocated for the operand
+     * of below I32TOI64 insn, which may have been overwritten in the
+     * previous MOV, for example, in the below insns:
+     *   MOV             I5, I15
+     *   I32TOI64        I6, i5
+     *   CALLNATIVE      VOID, native_func, I5, I6
+     * i5 is used in the second insn, but it has been overwritten in I5
+     * by the first insn
+     */
+    for (i = 0; i < lock_i32_reg_num; i++) {
+        GEN_INSN(MOV, i32_arg_regs[i], i32_arg_regs[i]);
     }
 
     i64_reg_idx = float_reg_idx = 0;
@@ -832,6 +894,14 @@ emit_callnative(JitCompContext *cc, JitReg native_func_reg, JitReg res,
                 bh_assert(0);
                 return false;
         }
+    }
+
+    /*
+     * Announce the locked i32 registers are being used, and do necessary
+     * spill ASAP
+     */
+    for (i = 0; i < lock_i32_reg_num; i++) {
+        GEN_INSN(MOV, i32_arg_regs[i], i32_arg_regs[i]);
     }
 
     if (res) {

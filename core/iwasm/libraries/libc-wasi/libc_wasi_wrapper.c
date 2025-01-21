@@ -6,6 +6,12 @@
 #include "libc_wasi_wrapper.h"
 #include "bh_platform.h"
 #include "wasm_export.h"
+#include "wasm_runtime_common.h"
+#include "wasmtime_ssp.h"
+
+#if WASM_ENABLE_THREAD_MGR != 0
+#include "../../../thread-mgr/thread_manager.h"
+#endif
 
 void
 wasm_runtime_set_exception(wasm_module_inst_t module, const char *exception);
@@ -46,25 +52,27 @@ typedef struct iovec_app {
     uint32 buf_len;
 } iovec_app_t;
 
-typedef struct WASIContext {
-    struct fd_table *curfds;
-    struct fd_prestats *prestats;
-    struct argv_environ_values *argv_environ;
-    struct addr_pool *addr_pool;
-    char *ns_lookup_buf;
-    char **ns_lookup_list;
-    char *argv_buf;
-    char **argv_list;
-    char *env_buf;
-    char **env_list;
-    uint32_t exit_code;
-} * wasi_ctx_t;
+typedef struct WASIContext *wasi_ctx_t;
 
 wasi_ctx_t
 wasm_runtime_get_wasi_ctx(wasm_module_inst_t module_inst);
 
+#if WASM_ENABLE_THREAD_MGR != 0
+static inline uint64_t
+min_uint64(uint64_t a, uint64_t b)
+{
+    return a > b ? b : a;
+}
+#endif
+
+static inline uint32_t
+min_uint32(uint32_t a, uint32_t b)
+{
+    return a > b ? b : a;
+}
+
 static inline struct fd_table *
-wasi_ctx_get_curfds(wasm_module_inst_t module_inst, wasi_ctx_t wasi_ctx)
+wasi_ctx_get_curfds(wasi_ctx_t wasi_ctx)
 {
     if (!wasi_ctx)
         return NULL;
@@ -80,7 +88,7 @@ wasi_ctx_get_argv_environ(wasm_module_inst_t module_inst, wasi_ctx_t wasi_ctx)
 }
 
 static inline struct fd_prestats *
-wasi_ctx_get_prestats(wasm_module_inst_t module_inst, wasi_ctx_t wasi_ctx)
+wasi_ctx_get_prestats(wasi_ctx_t wasi_ctx)
 {
     if (!wasi_ctx)
         return NULL;
@@ -88,7 +96,7 @@ wasi_ctx_get_prestats(wasm_module_inst_t module_inst, wasi_ctx_t wasi_ctx)
 }
 
 static inline struct addr_pool *
-wasi_ctx_get_addr_pool(wasm_module_inst_t module_inst, wasi_ctx_t wasi_ctx)
+wasi_ctx_get_addr_pool(wasi_ctx_t wasi_ctx)
 {
     if (!wasi_ctx)
         return NULL;
@@ -124,9 +132,9 @@ wasi_args_get(wasm_exec_env_t exec_env, uint32 *argv_offsets, char *argv_buf)
 
     total_size = sizeof(int32) * ((uint64)argc + 1);
     if (total_size >= UINT32_MAX
-        || !validate_native_addr(argv_offsets, (uint32)total_size)
+        || !validate_native_addr(argv_offsets, total_size)
         || argv_buf_size >= UINT32_MAX
-        || !validate_native_addr(argv_buf, (uint32)argv_buf_size))
+        || !validate_native_addr(argv_buf, (uint64)argv_buf_size))
         return (wasi_errno_t)-1;
 
     total_size = sizeof(char *) * ((uint64)argc + 1);
@@ -141,7 +149,7 @@ wasi_args_get(wasm_exec_env_t exec_env, uint32 *argv_offsets, char *argv_buf)
     }
 
     for (i = 0; i < argc; i++)
-        argv_offsets[i] = addr_native_to_app(argv[i]);
+        argv_offsets[i] = (uint32)addr_native_to_app(argv[i]);
 
     wasm_runtime_free(argv);
     return 0;
@@ -160,8 +168,8 @@ wasi_args_sizes_get(wasm_exec_env_t exec_env, uint32 *argc_app,
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(argc_app, sizeof(uint32))
-        || !validate_native_addr(argv_buf_size_app, sizeof(uint32)))
+    if (!validate_native_addr(argc_app, (uint64)sizeof(uint32))
+        || !validate_native_addr(argv_buf_size_app, (uint64)sizeof(uint32)))
         return (wasi_errno_t)-1;
 
     argv_environ = wasi_ctx->argv_environ;
@@ -182,10 +190,10 @@ wasi_clock_res_get(wasm_exec_env_t exec_env,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
 
-    if (!validate_native_addr(resolution, sizeof(wasi_timestamp_t)))
+    if (!validate_native_addr(resolution, (uint64)sizeof(wasi_timestamp_t)))
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_clock_res_get(clock_id, resolution);
+    return os_clock_res_get(clock_id, resolution);
 }
 
 static wasi_errno_t
@@ -196,10 +204,10 @@ wasi_clock_time_get(wasm_exec_env_t exec_env,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
 
-    if (!validate_native_addr(time, sizeof(wasi_timestamp_t)))
+    if (!validate_native_addr(time, (uint64)sizeof(wasi_timestamp_t)))
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_clock_time_get(clock_id, precision, time);
+    return os_clock_time_get(clock_id, precision, time);
 }
 
 static wasi_errno_t
@@ -225,9 +233,9 @@ wasi_environ_get(wasm_exec_env_t exec_env, uint32 *environ_offsets,
 
     total_size = sizeof(int32) * ((uint64)environ_count + 1);
     if (total_size >= UINT32_MAX
-        || !validate_native_addr(environ_offsets, (uint32)total_size)
+        || !validate_native_addr(environ_offsets, total_size)
         || environ_buf_size >= UINT32_MAX
-        || !validate_native_addr(environ_buf, (uint32)environ_buf_size))
+        || !validate_native_addr(environ_buf, (uint64)environ_buf_size))
         return (wasi_errno_t)-1;
 
     total_size = sizeof(char *) * (((uint64)environ_count + 1));
@@ -243,7 +251,7 @@ wasi_environ_get(wasm_exec_env_t exec_env, uint32 *environ_offsets,
     }
 
     for (i = 0; i < environ_count; i++)
-        environ_offsets[i] = addr_native_to_app(environs[i]);
+        environ_offsets[i] = (uint32)addr_native_to_app(environs[i]);
 
     wasm_runtime_free(environs);
     return 0;
@@ -263,8 +271,8 @@ wasi_environ_sizes_get(wasm_exec_env_t exec_env, uint32 *environ_count_app,
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(environ_count_app, sizeof(uint32))
-        || !validate_native_addr(environ_buf_size_app, sizeof(uint32)))
+    if (!validate_native_addr(environ_count_app, (uint64)sizeof(uint32))
+        || !validate_native_addr(environ_buf_size_app, (uint64)sizeof(uint32)))
         return (wasi_errno_t)-1;
 
     err = wasmtime_ssp_environ_sizes_get(argv_environ, &environ_count,
@@ -284,14 +292,14 @@ wasi_fd_prestat_get(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_prestats *prestats = wasi_ctx_get_prestats(module_inst, wasi_ctx);
+    struct fd_prestats *prestats = wasi_ctx_get_prestats(wasi_ctx);
     wasi_prestat_t prestat;
     wasi_errno_t err;
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(prestat_app, sizeof(wasi_prestat_app_t)))
+    if (!validate_native_addr(prestat_app, (uint64)sizeof(wasi_prestat_app_t)))
         return (wasi_errno_t)-1;
 
     err = wasmtime_ssp_fd_prestat_get(prestats, fd, &prestat);
@@ -309,7 +317,7 @@ wasi_fd_prestat_dir_name(wasm_exec_env_t exec_env, wasi_fd_t fd, char *path,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_prestats *prestats = wasi_ctx_get_prestats(module_inst, wasi_ctx);
+    struct fd_prestats *prestats = wasi_ctx_get_prestats(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
@@ -322,13 +330,13 @@ wasi_fd_close(wasm_exec_env_t exec_env, wasi_fd_t fd)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
-    struct fd_prestats *prestats = wasi_ctx_get_prestats(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
+    struct fd_prestats *prestats = wasi_ctx_get_prestats(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_close(curfds, prestats, fd);
+    return wasmtime_ssp_fd_close(exec_env, curfds, prestats, fd);
 }
 
 static wasi_errno_t
@@ -336,12 +344,12 @@ wasi_fd_datasync(wasm_exec_env_t exec_env, wasi_fd_t fd)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_datasync(curfds, fd);
+    return wasmtime_ssp_fd_datasync(exec_env, curfds, fd);
 }
 
 static wasi_errno_t
@@ -350,7 +358,7 @@ wasi_fd_pread(wasm_exec_env_t exec_env, wasi_fd_t fd, iovec_app_t *iovec_app,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     wasi_iovec_t *iovec, *iovec_begin;
     uint64 total_size;
     size_t nread;
@@ -361,9 +369,9 @@ wasi_fd_pread(wasm_exec_env_t exec_env, wasi_fd_t fd, iovec_app_t *iovec_app,
         return (wasi_errno_t)-1;
 
     total_size = sizeof(iovec_app_t) * (uint64)iovs_len;
-    if (!validate_native_addr(nread_app, (uint32)sizeof(uint32))
+    if (!validate_native_addr(nread_app, (uint64)sizeof(uint32))
         || total_size >= UINT32_MAX
-        || !validate_native_addr(iovec_app, (uint32)total_size))
+        || !validate_native_addr(iovec_app, total_size))
         return (wasi_errno_t)-1;
 
     total_size = sizeof(wasi_iovec_t) * (uint64)iovs_len;
@@ -374,16 +382,17 @@ wasi_fd_pread(wasm_exec_env_t exec_env, wasi_fd_t fd, iovec_app_t *iovec_app,
     iovec = iovec_begin;
 
     for (i = 0; i < iovs_len; i++, iovec_app++, iovec++) {
-        if (!validate_app_addr(iovec_app->buf_offset, iovec_app->buf_len)) {
+        if (!validate_app_addr((uint64)iovec_app->buf_offset,
+                               (uint64)iovec_app->buf_len)) {
             err = (wasi_errno_t)-1;
             goto fail;
         }
-        iovec->buf = (void *)addr_app_to_native(iovec_app->buf_offset);
+        iovec->buf = (void *)addr_app_to_native((uint64)iovec_app->buf_offset);
         iovec->buf_len = iovec_app->buf_len;
     }
 
-    err = wasmtime_ssp_fd_pread(curfds, fd, iovec_begin, iovs_len, offset,
-                                &nread);
+    err = wasmtime_ssp_fd_pread(exec_env, curfds, fd, iovec_begin, iovs_len,
+                                offset, &nread);
     if (err)
         goto fail;
 
@@ -404,7 +413,7 @@ wasi_fd_pwrite(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     wasi_ciovec_t *ciovec, *ciovec_begin;
     uint64 total_size;
     size_t nwritten;
@@ -415,9 +424,9 @@ wasi_fd_pwrite(wasm_exec_env_t exec_env, wasi_fd_t fd,
         return (wasi_errno_t)-1;
 
     total_size = sizeof(iovec_app_t) * (uint64)iovs_len;
-    if (!validate_native_addr(nwritten_app, (uint32)sizeof(uint32))
+    if (!validate_native_addr(nwritten_app, (uint64)sizeof(uint32))
         || total_size >= UINT32_MAX
-        || !validate_native_addr((void *)iovec_app, (uint32)total_size))
+        || !validate_native_addr((void *)iovec_app, total_size))
         return (wasi_errno_t)-1;
 
     total_size = sizeof(wasi_ciovec_t) * (uint64)iovs_len;
@@ -428,16 +437,17 @@ wasi_fd_pwrite(wasm_exec_env_t exec_env, wasi_fd_t fd,
     ciovec = ciovec_begin;
 
     for (i = 0; i < iovs_len; i++, iovec_app++, ciovec++) {
-        if (!validate_app_addr(iovec_app->buf_offset, iovec_app->buf_len)) {
+        if (!validate_app_addr((uint64)iovec_app->buf_offset,
+                               (uint64)iovec_app->buf_len)) {
             err = (wasi_errno_t)-1;
             goto fail;
         }
-        ciovec->buf = (char *)addr_app_to_native(iovec_app->buf_offset);
+        ciovec->buf = (char *)addr_app_to_native((uint64)iovec_app->buf_offset);
         ciovec->buf_len = iovec_app->buf_len;
     }
 
-    err = wasmtime_ssp_fd_pwrite(curfds, fd, ciovec_begin, iovs_len, offset,
-                                 &nwritten);
+    err = wasmtime_ssp_fd_pwrite(exec_env, curfds, fd, ciovec_begin, iovs_len,
+                                 offset, &nwritten);
     if (err)
         goto fail;
 
@@ -457,7 +467,7 @@ wasi_fd_read(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     wasi_iovec_t *iovec, *iovec_begin;
     uint64 total_size;
     size_t nread;
@@ -468,9 +478,9 @@ wasi_fd_read(wasm_exec_env_t exec_env, wasi_fd_t fd,
         return (wasi_errno_t)-1;
 
     total_size = sizeof(iovec_app_t) * (uint64)iovs_len;
-    if (!validate_native_addr(nread_app, (uint32)sizeof(uint32))
+    if (!validate_native_addr(nread_app, (uint64)sizeof(uint32))
         || total_size >= UINT32_MAX
-        || !validate_native_addr((void *)iovec_app, (uint32)total_size))
+        || !validate_native_addr((void *)iovec_app, total_size))
         return (wasi_errno_t)-1;
 
     total_size = sizeof(wasi_iovec_t) * (uint64)iovs_len;
@@ -481,15 +491,17 @@ wasi_fd_read(wasm_exec_env_t exec_env, wasi_fd_t fd,
     iovec = iovec_begin;
 
     for (i = 0; i < iovs_len; i++, iovec_app++, iovec++) {
-        if (!validate_app_addr(iovec_app->buf_offset, iovec_app->buf_len)) {
+        if (!validate_app_addr((uint64)iovec_app->buf_offset,
+                               (uint64)iovec_app->buf_len)) {
             err = (wasi_errno_t)-1;
             goto fail;
         }
-        iovec->buf = (void *)addr_app_to_native(iovec_app->buf_offset);
+        iovec->buf = (void *)addr_app_to_native((uint64)iovec_app->buf_offset);
         iovec->buf_len = iovec_app->buf_len;
     }
 
-    err = wasmtime_ssp_fd_read(curfds, fd, iovec_begin, iovs_len, &nread);
+    err = wasmtime_ssp_fd_read(exec_env, curfds, fd, iovec_begin, iovs_len,
+                               &nread);
     if (err)
         goto fail;
 
@@ -508,13 +520,13 @@ wasi_fd_renumber(wasm_exec_env_t exec_env, wasi_fd_t from, wasi_fd_t to)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
-    struct fd_prestats *prestats = wasi_ctx_get_prestats(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
+    struct fd_prestats *prestats = wasi_ctx_get_prestats(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_renumber(curfds, prestats, from, to);
+    return wasmtime_ssp_fd_renumber(exec_env, curfds, prestats, from, to);
 }
 
 static wasi_errno_t
@@ -523,15 +535,16 @@ wasi_fd_seek(wasm_exec_env_t exec_env, wasi_fd_t fd, wasi_filedelta_t offset,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(newoffset, sizeof(wasi_filesize_t)))
+    if (!validate_native_addr(newoffset, (uint64)sizeof(wasi_filesize_t)))
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_seek(curfds, fd, offset, whence, newoffset);
+    return wasmtime_ssp_fd_seek(exec_env, curfds, fd, offset, whence,
+                                newoffset);
 }
 
 static wasi_errno_t
@@ -539,15 +552,15 @@ wasi_fd_tell(wasm_exec_env_t exec_env, wasi_fd_t fd, wasi_filesize_t *newoffset)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(newoffset, sizeof(wasi_filesize_t)))
+    if (!validate_native_addr(newoffset, (uint64)sizeof(wasi_filesize_t)))
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_tell(curfds, fd, newoffset);
+    return wasmtime_ssp_fd_tell(exec_env, curfds, fd, newoffset);
 }
 
 static wasi_errno_t
@@ -556,17 +569,17 @@ wasi_fd_fdstat_get(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     wasi_fdstat_t fdstat;
     wasi_errno_t err;
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(fdstat_app, sizeof(wasi_fdstat_t)))
+    if (!validate_native_addr(fdstat_app, (uint64)sizeof(wasi_fdstat_t)))
         return (wasi_errno_t)-1;
 
-    err = wasmtime_ssp_fd_fdstat_get(curfds, fd, &fdstat);
+    err = wasmtime_ssp_fd_fdstat_get(exec_env, curfds, fd, &fdstat);
     if (err)
         return err;
 
@@ -580,12 +593,12 @@ wasi_fd_fdstat_set_flags(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_fdstat_set_flags(curfds, fd, flags);
+    return wasmtime_ssp_fd_fdstat_set_flags(exec_env, curfds, fd, flags);
 }
 
 static wasi_errno_t
@@ -595,13 +608,13 @@ wasi_fd_fdstat_set_rights(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_fdstat_set_rights(curfds, fd, fs_rights_base,
-                                             fs_rights_inheriting);
+    return wasmtime_ssp_fd_fdstat_set_rights(
+        exec_env, curfds, fd, fs_rights_base, fs_rights_inheriting);
 }
 
 static wasi_errno_t
@@ -609,12 +622,12 @@ wasi_fd_sync(wasm_exec_env_t exec_env, wasi_fd_t fd)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_sync(curfds, fd);
+    return wasmtime_ssp_fd_sync(exec_env, curfds, fd);
 }
 
 static wasi_errno_t
@@ -624,7 +637,7 @@ wasi_fd_write(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     wasi_ciovec_t *ciovec, *ciovec_begin;
     uint64 total_size;
     size_t nwritten;
@@ -635,9 +648,9 @@ wasi_fd_write(wasm_exec_env_t exec_env, wasi_fd_t fd,
         return (wasi_errno_t)-1;
 
     total_size = sizeof(iovec_app_t) * (uint64)iovs_len;
-    if (!validate_native_addr(nwritten_app, (uint32)sizeof(uint32))
+    if (!validate_native_addr(nwritten_app, (uint64)sizeof(uint32))
         || total_size >= UINT32_MAX
-        || !validate_native_addr((void *)iovec_app, (uint32)total_size))
+        || !validate_native_addr((void *)iovec_app, total_size))
         return (wasi_errno_t)-1;
 
     total_size = sizeof(wasi_ciovec_t) * (uint64)iovs_len;
@@ -648,15 +661,17 @@ wasi_fd_write(wasm_exec_env_t exec_env, wasi_fd_t fd,
     ciovec = ciovec_begin;
 
     for (i = 0; i < iovs_len; i++, iovec_app++, ciovec++) {
-        if (!validate_app_addr(iovec_app->buf_offset, iovec_app->buf_len)) {
+        if (!validate_app_addr((uint64)iovec_app->buf_offset,
+                               (uint64)iovec_app->buf_len)) {
             err = (wasi_errno_t)-1;
             goto fail;
         }
-        ciovec->buf = (char *)addr_app_to_native(iovec_app->buf_offset);
+        ciovec->buf = (char *)addr_app_to_native((uint64)iovec_app->buf_offset);
         ciovec->buf_len = iovec_app->buf_len;
     }
 
-    err = wasmtime_ssp_fd_write(curfds, fd, ciovec_begin, iovs_len, &nwritten);
+    err = wasmtime_ssp_fd_write(exec_env, curfds, fd, ciovec_begin, iovs_len,
+                                &nwritten);
     if (err)
         goto fail;
 
@@ -676,12 +691,12 @@ wasi_fd_advise(wasm_exec_env_t exec_env, wasi_fd_t fd, wasi_filesize_t offset,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_advise(curfds, fd, offset, len, advice);
+    return wasmtime_ssp_fd_advise(exec_env, curfds, fd, offset, len, advice);
 }
 
 static wasi_errno_t
@@ -690,12 +705,12 @@ wasi_fd_allocate(wasm_exec_env_t exec_env, wasi_fd_t fd, wasi_filesize_t offset,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_allocate(curfds, fd, offset, len);
+    return wasmtime_ssp_fd_allocate(exec_env, curfds, fd, offset, len);
 }
 
 static wasi_errno_t
@@ -704,12 +719,13 @@ wasi_path_create_directory(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_path_create_directory(curfds, fd, path, path_len);
+    return wasmtime_ssp_path_create_directory(exec_env, curfds, fd, path,
+                                              path_len);
 }
 
 static wasi_errno_t
@@ -720,14 +736,15 @@ wasi_path_link(wasm_exec_env_t exec_env, wasi_fd_t old_fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
-    struct fd_prestats *prestats = wasi_ctx_get_prestats(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
+    struct fd_prestats *prestats = wasi_ctx_get_prestats(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_path_link(curfds, prestats, old_fd, old_flags, old_path,
-                                  old_path_len, new_fd, new_path, new_path_len);
+    return wasmtime_ssp_path_link(exec_env, curfds, prestats, old_fd, old_flags,
+                                  old_path, old_path_len, new_fd, new_path,
+                                  new_path_len);
 }
 
 static wasi_errno_t
@@ -739,19 +756,19 @@ wasi_path_open(wasm_exec_env_t exec_env, wasi_fd_t dirfd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     wasi_fd_t fd = (wasi_fd_t)-1; /* set fd_app -1 if path open failed */
     wasi_errno_t err;
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(fd_app, sizeof(wasi_fd_t)))
+    if (!validate_native_addr(fd_app, (uint64)sizeof(wasi_fd_t)))
         return (wasi_errno_t)-1;
 
-    err = wasmtime_ssp_path_open(curfds, dirfd, dirflags, path, path_len,
-                                 oflags, fs_rights_base, fs_rights_inheriting,
-                                 fs_flags, &fd);
+    err = wasmtime_ssp_path_open(exec_env, curfds, dirfd, dirflags, path,
+                                 path_len, oflags, fs_rights_base,
+                                 fs_rights_inheriting, fs_flags, &fd);
 
     *fd_app = fd;
     return err;
@@ -763,17 +780,18 @@ wasi_fd_readdir(wasm_exec_env_t exec_env, wasi_fd_t fd, void *buf,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     size_t bufused;
     wasi_errno_t err;
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(bufused_app, sizeof(uint32)))
+    if (!validate_native_addr(bufused_app, (uint64)sizeof(uint32)))
         return (wasi_errno_t)-1;
 
-    err = wasmtime_ssp_fd_readdir(curfds, fd, buf, buf_len, cookie, &bufused);
+    err = wasmtime_ssp_fd_readdir(exec_env, curfds, fd, buf, buf_len, cookie,
+                                  &bufused);
     if (err)
         return err;
 
@@ -788,18 +806,18 @@ wasi_path_readlink(wasm_exec_env_t exec_env, wasi_fd_t fd, const char *path,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     size_t bufused;
     wasi_errno_t err;
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(bufused_app, sizeof(uint32)))
+    if (!validate_native_addr(bufused_app, (uint64)sizeof(uint32)))
         return (wasi_errno_t)-1;
 
-    err = wasmtime_ssp_path_readlink(curfds, fd, path, path_len, buf, buf_len,
-                                     &bufused);
+    err = wasmtime_ssp_path_readlink(exec_env, curfds, fd, path, path_len, buf,
+                                     buf_len, &bufused);
     if (err)
         return err;
 
@@ -814,13 +832,14 @@ wasi_path_rename(wasm_exec_env_t exec_env, wasi_fd_t old_fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_path_rename(curfds, old_fd, old_path, old_path_len,
-                                    new_fd, new_path, new_path_len);
+    return wasmtime_ssp_path_rename(exec_env, curfds, old_fd, old_path,
+                                    old_path_len, new_fd, new_path,
+                                    new_path_len);
 }
 
 static wasi_errno_t
@@ -829,15 +848,15 @@ wasi_fd_filestat_get(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(filestat, sizeof(wasi_filestat_t)))
+    if (!validate_native_addr(filestat, (uint64)sizeof(wasi_filestat_t)))
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_filestat_get(curfds, fd, filestat);
+    return wasmtime_ssp_fd_filestat_get(exec_env, curfds, fd, filestat);
 }
 
 static wasi_errno_t
@@ -847,13 +866,13 @@ wasi_fd_filestat_set_times(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_filestat_set_times(curfds, fd, st_atim, st_mtim,
-                                              fstflags);
+    return wasmtime_ssp_fd_filestat_set_times(exec_env, curfds, fd, st_atim,
+                                              st_mtim, fstflags);
 }
 
 static wasi_errno_t
@@ -862,12 +881,12 @@ wasi_fd_filestat_set_size(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_fd_filestat_set_size(curfds, fd, st_size);
+    return wasmtime_ssp_fd_filestat_set_size(exec_env, curfds, fd, st_size);
 }
 
 static wasi_errno_t
@@ -877,16 +896,16 @@ wasi_path_filestat_get(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr(filestat, sizeof(wasi_filestat_t)))
+    if (!validate_native_addr(filestat, (uint64)sizeof(wasi_filestat_t)))
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_path_filestat_get(curfds, fd, flags, path, path_len,
-                                          filestat);
+    return wasmtime_ssp_path_filestat_get(exec_env, curfds, fd, flags, path,
+                                          path_len, filestat);
 }
 
 static wasi_errno_t
@@ -897,13 +916,14 @@ wasi_path_filestat_set_times(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_path_filestat_set_times(
-        curfds, fd, flags, path, path_len, st_atim, st_mtim, fstflags);
+    return wasmtime_ssp_path_filestat_set_times(exec_env, curfds, fd, flags,
+                                                path, path_len, st_atim,
+                                                st_mtim, fstflags);
 }
 
 static wasi_errno_t
@@ -913,14 +933,14 @@ wasi_path_symlink(wasm_exec_env_t exec_env, const char *old_path,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
-    struct fd_prestats *prestats = wasi_ctx_get_prestats(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
+    struct fd_prestats *prestats = wasi_ctx_get_prestats(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_path_symlink(curfds, prestats, old_path, old_path_len,
-                                     fd, new_path, new_path_len);
+    return wasmtime_ssp_path_symlink(exec_env, curfds, prestats, old_path,
+                                     old_path_len, fd, new_path, new_path_len);
 }
 
 static wasi_errno_t
@@ -929,12 +949,12 @@ wasi_path_unlink_file(wasm_exec_env_t exec_env, wasi_fd_t fd, const char *path,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_path_unlink_file(curfds, fd, path, path_len);
+    return wasmtime_ssp_path_unlink_file(exec_env, curfds, fd, path, path_len);
 }
 
 static wasi_errno_t
@@ -943,13 +963,117 @@ wasi_path_remove_directory(wasm_exec_env_t exec_env, wasi_fd_t fd,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    return wasmtime_ssp_path_remove_directory(curfds, fd, path, path_len);
+    return wasmtime_ssp_path_remove_directory(exec_env, curfds, fd, path,
+                                              path_len);
 }
+
+#if WASM_ENABLE_THREAD_MGR != 0
+static __wasi_timestamp_t
+get_timeout_for_poll_oneoff(const wasi_subscription_t *in,
+                            uint32 nsubscriptions)
+{
+    __wasi_timestamp_t timeout = (__wasi_timestamp_t)-1;
+    uint32 i = 0;
+
+    for (i = 0; i < nsubscriptions; ++i) {
+        const __wasi_subscription_t *s = &in[i];
+        if (s->u.type == __WASI_EVENTTYPE_CLOCK
+            && (s->u.u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME) == 0) {
+            timeout = min_uint64(timeout, s->u.u.clock.timeout);
+        }
+    }
+    return timeout;
+}
+
+static void
+update_clock_subscription_data(wasi_subscription_t *in, uint32 nsubscriptions,
+                               const wasi_timestamp_t new_timeout)
+{
+    uint32 i = 0;
+    for (i = 0; i < nsubscriptions; ++i) {
+        __wasi_subscription_t *s = &in[i];
+        if (s->u.type == __WASI_EVENTTYPE_CLOCK) {
+            s->u.u.clock.timeout = new_timeout;
+        }
+    }
+}
+
+static wasi_errno_t
+execute_interruptible_poll_oneoff(
+#if !defined(WASMTIME_SSP_STATIC_CURFDS)
+    struct fd_table *curfds,
+#endif
+    const __wasi_subscription_t *in, __wasi_event_t *out, size_t nsubscriptions,
+    size_t *nevents, wasm_exec_env_t exec_env)
+{
+    if (nsubscriptions == 0) {
+        *nevents = 0;
+        return __WASI_ESUCCESS;
+    }
+
+    wasi_errno_t err;
+    __wasi_timestamp_t elapsed = 0;
+    bool all_outs_are_type_clock;
+    uint32 i;
+
+    const __wasi_timestamp_t timeout = get_timeout_for_poll_oneoff(
+                                 in, (uint32)nsubscriptions),
+                             time_quant = (__wasi_timestamp_t)1e9;
+    const uint64 size_to_copy =
+        nsubscriptions * (uint64)sizeof(wasi_subscription_t);
+    __wasi_subscription_t *in_copy = NULL;
+
+    if (size_to_copy >= UINT32_MAX
+        || !(in_copy = (__wasi_subscription_t *)wasm_runtime_malloc(
+                 (uint32)size_to_copy))) {
+        return __WASI_ENOMEM;
+    }
+
+    bh_memcpy_s(in_copy, (uint32)size_to_copy, in, (uint32)size_to_copy);
+
+    while (timeout == (__wasi_timestamp_t)-1 || elapsed <= timeout) {
+        /* update timeout for clock subscription events */
+        update_clock_subscription_data(
+            in_copy, (uint32)nsubscriptions,
+            min_uint64(time_quant, timeout - elapsed));
+        err = wasmtime_ssp_poll_oneoff(exec_env, curfds, in_copy, out,
+                                       nsubscriptions, nevents);
+        elapsed += time_quant;
+
+        if (err) {
+            wasm_runtime_free(in_copy);
+            return err;
+        }
+
+        if (wasm_cluster_is_thread_terminated(exec_env)) {
+            wasm_runtime_free(in_copy);
+            return __WASI_EINTR;
+        }
+        else if (*nevents > 0) {
+            all_outs_are_type_clock = true;
+            for (i = 0; i < *nevents; i++) {
+                if (out[i].type != __WASI_EVENTTYPE_CLOCK) {
+                    all_outs_are_type_clock = false;
+                    break;
+                }
+            }
+
+            if (!all_outs_are_type_clock) {
+                wasm_runtime_free(in_copy);
+                return __WASI_ESUCCESS;
+            }
+        }
+    }
+
+    wasm_runtime_free(in_copy);
+    return __WASI_ESUCCESS;
+}
+#endif
 
 static wasi_errno_t
 wasi_poll_oneoff(wasm_exec_env_t exec_env, const wasi_subscription_t *in,
@@ -957,19 +1081,25 @@ wasi_poll_oneoff(wasm_exec_env_t exec_env, const wasi_subscription_t *in,
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
-    size_t nevents;
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
+    size_t nevents = 0;
     wasi_errno_t err;
 
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
-    if (!validate_native_addr((void *)in, sizeof(wasi_subscription_t))
-        || !validate_native_addr(out, sizeof(wasi_event_t))
-        || !validate_native_addr(nevents_app, sizeof(uint32)))
+    if (!validate_native_addr((void *)in, (uint64)sizeof(wasi_subscription_t))
+        || !validate_native_addr(out, (uint64)sizeof(wasi_event_t))
+        || !validate_native_addr(nevents_app, (uint64)sizeof(uint32)))
         return (wasi_errno_t)-1;
 
-    err = wasmtime_ssp_poll_oneoff(curfds, in, out, nsubscriptions, &nevents);
+#if WASM_ENABLE_THREAD_MGR == 0
+    err = wasmtime_ssp_poll_oneoff(exec_env, curfds, in, out, nsubscriptions,
+                                   &nevents);
+#else
+    err = execute_interruptible_poll_oneoff(curfds, in, out, nsubscriptions,
+                                            &nevents, exec_env);
+#endif
     if (err)
         return err;
 
@@ -1003,6 +1133,8 @@ wasi_proc_raise(wasm_exec_env_t exec_env, wasi_signal_t sig)
 static wasi_errno_t
 wasi_random_get(wasm_exec_env_t exec_env, void *buf, uint32 buf_len)
 {
+    (void)exec_env;
+
     return wasmtime_ssp_random_get(buf, buf_len);
 }
 
@@ -1017,9 +1149,9 @@ wasi_sock_accept(wasm_exec_env_t exec_env, wasi_fd_t fd, wasi_fdflags_t flags,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasi_ssp_sock_accept(curfds, fd, flags, fd_new);
+    return wasi_ssp_sock_accept(exec_env, curfds, fd, flags, fd_new);
 }
 
 static wasi_errno_t
@@ -1033,12 +1165,12 @@ wasi_sock_addr_local(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(addr, sizeof(__wasi_addr_t)))
+    if (!validate_native_addr(addr, (uint64)sizeof(__wasi_addr_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasi_ssp_sock_addr_local(curfds, fd, addr);
+    return wasi_ssp_sock_addr_local(exec_env, curfds, fd, addr);
 }
 
 static wasi_errno_t
@@ -1052,12 +1184,12 @@ wasi_sock_addr_remote(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(addr, sizeof(__wasi_addr_t)))
+    if (!validate_native_addr(addr, (uint64)sizeof(__wasi_addr_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasi_ssp_sock_addr_remote(curfds, fd, addr);
+    return wasi_ssp_sock_addr_remote(exec_env, curfds, fd, addr);
 }
 
 static wasi_errno_t
@@ -1075,11 +1207,11 @@ wasi_sock_addr_resolve(wasm_exec_env_t exec_env, const char *host,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
     ns_lookup_list = wasi_ctx_get_ns_lookup_list(wasi_ctx);
 
-    return wasi_ssp_sock_addr_resolve(curfds, ns_lookup_list, host, service,
-                                      hints, addr_info, addr_info_size,
+    return wasi_ssp_sock_addr_resolve(exec_env, curfds, ns_lookup_list, host,
+                                      service, hints, addr_info, addr_info_size,
                                       max_info_size);
 }
 
@@ -1094,15 +1226,18 @@ wasi_sock_bind(wasm_exec_env_t exec_env, wasi_fd_t fd, wasi_addr_t *addr)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
-    addr_pool = wasi_ctx_get_addr_pool(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
+    addr_pool = wasi_ctx_get_addr_pool(wasi_ctx);
 
-    return wasi_ssp_sock_bind(curfds, addr_pool, fd, addr);
+    return wasi_ssp_sock_bind(exec_env, curfds, addr_pool, fd, addr);
 }
 
 static wasi_errno_t
 wasi_sock_close(wasm_exec_env_t exec_env, wasi_fd_t fd)
 {
+    (void)exec_env;
+    (void)fd;
+
     return __WASI_ENOSYS;
 }
 
@@ -1117,10 +1252,10 @@ wasi_sock_connect(wasm_exec_env_t exec_env, wasi_fd_t fd, wasi_addr_t *addr)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
-    addr_pool = wasi_ctx_get_addr_pool(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
+    addr_pool = wasi_ctx_get_addr_pool(wasi_ctx);
 
-    return wasi_ssp_sock_connect(curfds, addr_pool, fd, addr);
+    return wasi_ssp_sock_connect(exec_env, curfds, addr_pool, fd, addr);
 }
 
 static wasi_errno_t
@@ -1134,12 +1269,12 @@ wasi_sock_get_broadcast(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_broadcast(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_get_broadcast(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1153,12 +1288,12 @@ wasi_sock_get_keep_alive(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_keep_alive(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_get_keep_alive(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1172,13 +1307,14 @@ wasi_sock_get_linger(wasm_exec_env_t exec_env, wasi_fd_t fd, bool *is_enabled,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool))
-        || !validate_native_addr(linger_s, sizeof(int)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool))
+        || !validate_native_addr(linger_s, (uint64)sizeof(int)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_linger(curfds, fd, is_enabled, linger_s);
+    return wasmtime_ssp_sock_get_linger(exec_env, curfds, fd, is_enabled,
+                                        linger_s);
 }
 
 static wasi_errno_t
@@ -1192,12 +1328,12 @@ wasi_sock_get_recv_buf_size(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(size, sizeof(wasi_size_t)))
+    if (!validate_native_addr(size, (uint64)sizeof(wasi_size_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_recv_buf_size(curfds, fd, size);
+    return wasmtime_ssp_sock_get_recv_buf_size(exec_env, curfds, fd, size);
 }
 
 static wasi_errno_t
@@ -1211,12 +1347,12 @@ wasi_sock_get_recv_timeout(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(timeout_us, sizeof(uint64_t)))
+    if (!validate_native_addr(timeout_us, (uint64)sizeof(uint64_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_recv_timeout(curfds, fd, timeout_us);
+    return wasmtime_ssp_sock_get_recv_timeout(exec_env, curfds, fd, timeout_us);
 }
 
 static wasi_errno_t
@@ -1230,12 +1366,12 @@ wasi_sock_get_reuse_addr(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_reuse_addr(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_get_reuse_addr(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1249,12 +1385,12 @@ wasi_sock_get_reuse_port(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_reuse_port(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_get_reuse_port(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1268,12 +1404,12 @@ wasi_sock_get_send_buf_size(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(size, sizeof(__wasi_size_t)))
+    if (!validate_native_addr(size, (uint64)sizeof(__wasi_size_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_send_buf_size(curfds, fd, size);
+    return wasmtime_ssp_sock_get_send_buf_size(exec_env, curfds, fd, size);
 }
 
 static wasi_errno_t
@@ -1287,12 +1423,12 @@ wasi_sock_get_send_timeout(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(timeout_us, sizeof(uint64_t)))
+    if (!validate_native_addr(timeout_us, (uint64)sizeof(uint64_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_send_timeout(curfds, fd, timeout_us);
+    return wasmtime_ssp_sock_get_send_timeout(exec_env, curfds, fd, timeout_us);
 }
 
 static wasi_errno_t
@@ -1306,12 +1442,13 @@ wasi_sock_get_tcp_fastopen_connect(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_tcp_fastopen_connect(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_get_tcp_fastopen_connect(exec_env, curfds, fd,
+                                                      is_enabled);
 }
 
 static wasi_errno_t
@@ -1325,12 +1462,12 @@ wasi_sock_get_tcp_no_delay(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_tcp_no_delay(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_get_tcp_no_delay(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1344,12 +1481,13 @@ wasi_sock_get_tcp_quick_ack(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_tcp_quick_ack(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_get_tcp_quick_ack(exec_env, curfds, fd,
+                                               is_enabled);
 }
 
 static wasi_errno_t
@@ -1363,12 +1501,12 @@ wasi_sock_get_tcp_keep_idle(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(time_s, sizeof(uint32_t)))
+    if (!validate_native_addr(time_s, (uint64)sizeof(uint32_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_tcp_keep_idle(curfds, fd, time_s);
+    return wasmtime_ssp_sock_get_tcp_keep_idle(exec_env, curfds, fd, time_s);
 }
 
 static wasi_errno_t
@@ -1382,12 +1520,12 @@ wasi_sock_get_tcp_keep_intvl(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(time_s, sizeof(uint32_t)))
+    if (!validate_native_addr(time_s, (uint64)sizeof(uint32_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_tcp_keep_intvl(curfds, fd, time_s);
+    return wasmtime_ssp_sock_get_tcp_keep_intvl(exec_env, curfds, fd, time_s);
 }
 
 static wasi_errno_t
@@ -1401,12 +1539,12 @@ wasi_sock_get_ip_multicast_loop(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_ip_multicast_loop(curfds, fd, ipv6,
+    return wasmtime_ssp_sock_get_ip_multicast_loop(exec_env, curfds, fd, ipv6,
                                                    is_enabled);
 }
 
@@ -1420,12 +1558,12 @@ wasi_sock_get_ip_ttl(wasm_exec_env_t exec_env, wasi_fd_t fd, uint8_t *ttl_s)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(ttl_s, sizeof(uint8_t)))
+    if (!validate_native_addr(ttl_s, (uint64)sizeof(uint8_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_ip_ttl(curfds, fd, ttl_s);
+    return wasmtime_ssp_sock_get_ip_ttl(exec_env, curfds, fd, ttl_s);
 }
 
 static wasi_errno_t
@@ -1439,12 +1577,12 @@ wasi_sock_get_ip_multicast_ttl(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(ttl_s, sizeof(uint8_t)))
+    if (!validate_native_addr(ttl_s, (uint64)sizeof(uint8_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_ip_multicast_ttl(curfds, fd, ttl_s);
+    return wasmtime_ssp_sock_get_ip_multicast_ttl(exec_env, curfds, fd, ttl_s);
 }
 
 static wasi_errno_t
@@ -1458,12 +1596,12 @@ wasi_sock_get_ipv6_only(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(is_enabled, sizeof(bool)))
+    if (!validate_native_addr(is_enabled, (uint64)sizeof(bool)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_get_ipv6_only(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_get_ipv6_only(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1476,9 +1614,9 @@ wasi_sock_listen(wasm_exec_env_t exec_env, wasi_fd_t fd, uint32 backlog)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasi_ssp_sock_listen(curfds, fd, backlog);
+    return wasi_ssp_sock_listen(exec_env, curfds, fd, backlog);
 }
 
 static wasi_errno_t
@@ -1493,9 +1631,9 @@ wasi_sock_open(wasm_exec_env_t exec_env, wasi_fd_t poolfd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasi_ssp_sock_open(curfds, poolfd, af, socktype, sockfd);
+    return wasi_ssp_sock_open(exec_env, curfds, poolfd, af, socktype, sockfd);
 }
 
 static wasi_errno_t
@@ -1508,9 +1646,9 @@ wasi_sock_set_broadcast(wasm_exec_env_t exec_env, wasi_fd_t fd, bool is_enabled)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_broadcast(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_set_broadcast(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1524,9 +1662,9 @@ wasi_sock_set_keep_alive(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_keep_alive(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_set_keep_alive(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1540,9 +1678,10 @@ wasi_sock_set_linger(wasm_exec_env_t exec_env, wasi_fd_t fd, bool is_enabled,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_linger(curfds, fd, is_enabled, linger_s);
+    return wasmtime_ssp_sock_set_linger(exec_env, curfds, fd, is_enabled,
+                                        linger_s);
 }
 
 static wasi_errno_t
@@ -1555,9 +1694,9 @@ wasi_sock_set_recv_buf_size(wasm_exec_env_t exec_env, wasi_fd_t fd, size_t size)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_recv_buf_size(curfds, fd, size);
+    return wasmtime_ssp_sock_set_recv_buf_size(exec_env, curfds, fd, size);
 }
 
 static wasi_errno_t
@@ -1571,9 +1710,9 @@ wasi_sock_set_recv_timeout(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_recv_timeout(curfds, fd, timeout_us);
+    return wasmtime_ssp_sock_set_recv_timeout(exec_env, curfds, fd, timeout_us);
 }
 
 static wasi_errno_t
@@ -1587,9 +1726,9 @@ wasi_sock_set_reuse_addr(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_reuse_addr(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_set_reuse_addr(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1603,9 +1742,9 @@ wasi_sock_set_reuse_port(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_reuse_port(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_set_reuse_port(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1618,9 +1757,9 @@ wasi_sock_set_send_buf_size(wasm_exec_env_t exec_env, wasi_fd_t fd, size_t size)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_send_buf_size(curfds, fd, size);
+    return wasmtime_ssp_sock_set_send_buf_size(exec_env, curfds, fd, size);
 }
 
 static wasi_errno_t
@@ -1634,9 +1773,9 @@ wasi_sock_set_send_timeout(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_send_timeout(curfds, fd, timeout_us);
+    return wasmtime_ssp_sock_set_send_timeout(exec_env, curfds, fd, timeout_us);
 }
 
 static wasi_errno_t
@@ -1650,9 +1789,10 @@ wasi_sock_set_tcp_fastopen_connect(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_tcp_fastopen_connect(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_set_tcp_fastopen_connect(exec_env, curfds, fd,
+                                                      is_enabled);
 }
 
 static wasi_errno_t
@@ -1666,9 +1806,9 @@ wasi_sock_set_tcp_no_delay(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_tcp_no_delay(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_set_tcp_no_delay(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1682,9 +1822,10 @@ wasi_sock_set_tcp_quick_ack(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_tcp_quick_ack(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_set_tcp_quick_ack(exec_env, curfds, fd,
+                                               is_enabled);
 }
 
 static wasi_errno_t
@@ -1698,9 +1839,9 @@ wasi_sock_set_tcp_keep_idle(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_tcp_keep_idle(curfds, fd, time_s);
+    return wasmtime_ssp_sock_set_tcp_keep_idle(exec_env, curfds, fd, time_s);
 }
 
 static wasi_errno_t
@@ -1714,9 +1855,9 @@ wasi_sock_set_tcp_keep_intvl(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_tcp_keep_intvl(curfds, fd, time_s);
+    return wasmtime_ssp_sock_set_tcp_keep_intvl(exec_env, curfds, fd, time_s);
 }
 
 static wasi_errno_t
@@ -1730,9 +1871,9 @@ wasi_sock_set_ip_multicast_loop(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_ip_multicast_loop(curfds, fd, ipv6,
+    return wasmtime_ssp_sock_set_ip_multicast_loop(exec_env, curfds, fd, ipv6,
                                                    is_enabled);
 }
 
@@ -1748,13 +1889,13 @@ wasi_sock_set_ip_add_membership(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(imr_multiaddr, sizeof(__wasi_addr_ip_t)))
+    if (!validate_native_addr(imr_multiaddr, (uint64)sizeof(__wasi_addr_ip_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_ip_add_membership(curfds, fd, imr_multiaddr,
-                                                   imr_interface);
+    return wasmtime_ssp_sock_set_ip_add_membership(
+        exec_env, curfds, fd, imr_multiaddr, imr_interface);
 }
 
 static wasi_errno_t
@@ -1769,13 +1910,13 @@ wasi_sock_set_ip_drop_membership(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    if (!validate_native_addr(imr_multiaddr, sizeof(__wasi_addr_ip_t)))
+    if (!validate_native_addr(imr_multiaddr, (uint64)sizeof(__wasi_addr_ip_t)))
         return __WASI_EINVAL;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_ip_drop_membership(curfds, fd, imr_multiaddr,
-                                                    imr_interface);
+    return wasmtime_ssp_sock_set_ip_drop_membership(
+        exec_env, curfds, fd, imr_multiaddr, imr_interface);
 }
 
 static wasi_errno_t
@@ -1788,9 +1929,9 @@ wasi_sock_set_ip_ttl(wasm_exec_env_t exec_env, wasi_fd_t fd, uint8_t ttl_s)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_ip_ttl(curfds, fd, ttl_s);
+    return wasmtime_ssp_sock_set_ip_ttl(exec_env, curfds, fd, ttl_s);
 }
 
 static wasi_errno_t
@@ -1804,9 +1945,9 @@ wasi_sock_set_ip_multicast_ttl(wasm_exec_env_t exec_env, wasi_fd_t fd,
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_ip_multicast_ttl(curfds, fd, ttl_s);
+    return wasmtime_ssp_sock_set_ip_multicast_ttl(exec_env, curfds, fd, ttl_s);
 }
 
 static wasi_errno_t
@@ -1819,9 +1960,9 @@ wasi_sock_set_ipv6_only(wasm_exec_env_t exec_env, wasi_fd_t fd, bool is_enabled)
     if (!wasi_ctx)
         return __WASI_EACCES;
 
-    curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    curfds = wasi_ctx_get_curfds(wasi_ctx);
 
-    return wasmtime_ssp_sock_set_ipv6_only(curfds, fd, is_enabled);
+    return wasmtime_ssp_sock_set_ipv6_only(exec_env, curfds, fd, is_enabled);
 }
 
 static wasi_errno_t
@@ -1839,7 +1980,7 @@ allocate_iovec_app_buffer(wasm_module_inst_t module_inst,
 
     total_size = sizeof(iovec_app_t) * (uint64)data_len;
     if (total_size >= UINT32_MAX
-        || !validate_native_addr((void *)data, (uint32)total_size))
+        || !validate_native_addr((void *)data, total_size))
         return __WASI_EINVAL;
 
     for (total_size = 0, i = 0; i < data_len; i++, data++) {
@@ -1861,12 +2002,6 @@ allocate_iovec_app_buffer(wasm_module_inst_t module_inst,
     return __WASI_ESUCCESS;
 }
 
-static inline size_t
-min(size_t a, size_t b)
-{
-    return a > b ? b : a;
-}
-
 static wasi_errno_t
 copy_buffer_to_iovec_app(wasm_module_inst_t module_inst, uint8 *buf_begin,
                          uint32 buf_size, iovec_app_t *data, uint32 data_len,
@@ -1883,12 +2018,14 @@ copy_buffer_to_iovec_app(wasm_module_inst_t module_inst, uint8 *buf_begin,
     for (i = 0; i < data_len; data++, i++) {
         char *native_addr;
 
-        if (!validate_app_addr(data->buf_offset, data->buf_len)) {
+        if (!validate_app_addr((uint64)data->buf_offset,
+                               (uint64)data->buf_len)) {
             return __WASI_EINVAL;
         }
 
         if (buf >= buf_begin + buf_size
-            || buf + data->buf_len < buf /* integer overflow */
+            /* integer overflow */
+            || data->buf_len > UINTPTR_MAX - (uintptr_t)buf
             || buf + data->buf_len > buf_begin + buf_size
             || size_to_copy == 0) {
             break;
@@ -1899,9 +2036,9 @@ copy_buffer_to_iovec_app(wasm_module_inst_t module_inst, uint8 *buf_begin,
          * only copy the amount in the app buffer. Otherwise, we fill the iovec
          * buffer and reduce size to copy on the next iteration
          */
-        size_to_copy_into_iovec = min(data->buf_len, size_to_copy);
+        size_to_copy_into_iovec = min_uint32(data->buf_len, size_to_copy);
 
-        native_addr = (void *)addr_app_to_native(data->buf_offset);
+        native_addr = (void *)addr_app_to_native((uint64)data->buf_offset);
         bh_memcpy_s(native_addr, size_to_copy_into_iovec, buf,
                     size_to_copy_into_iovec);
         buf += size_to_copy_into_iovec;
@@ -1923,7 +2060,7 @@ wasi_sock_recv_from(wasm_exec_env_t exec_env, wasi_fd_t sock,
      **/
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     uint64 total_size;
     uint8 *buf_begin = NULL;
     wasi_errno_t err;
@@ -1933,7 +2070,7 @@ wasi_sock_recv_from(wasm_exec_env_t exec_env, wasi_fd_t sock,
         return __WASI_EINVAL;
     }
 
-    if (!validate_native_addr(ro_data_len, (uint32)sizeof(uint32)))
+    if (!validate_native_addr(ro_data_len, (uint64)sizeof(uint32)))
         return __WASI_EINVAL;
 
     err = allocate_iovec_app_buffer(module_inst, ri_data, ri_data_len,
@@ -1945,8 +2082,9 @@ wasi_sock_recv_from(wasm_exec_env_t exec_env, wasi_fd_t sock,
     memset(buf_begin, 0, total_size);
 
     *ro_data_len = 0;
-    err = wasmtime_ssp_sock_recv_from(curfds, sock, buf_begin, total_size,
-                                      ri_flags, src_addr, &recv_bytes);
+    err = wasmtime_ssp_sock_recv_from(exec_env, curfds, sock, buf_begin,
+                                      total_size, ri_flags, src_addr,
+                                      &recv_bytes);
     if (err != __WASI_ESUCCESS) {
         goto fail;
     }
@@ -1971,7 +2109,7 @@ wasi_sock_recv(wasm_exec_env_t exec_env, wasi_fd_t sock, iovec_app_t *ri_data,
     __wasi_addr_t src_addr;
     wasi_errno_t error;
 
-    if (!validate_native_addr(ro_flags, (uint32)sizeof(wasi_roflags_t)))
+    if (!validate_native_addr(ro_flags, (uint64)sizeof(wasi_roflags_t)))
         return __WASI_EINVAL;
 
     error = wasi_sock_recv_from(exec_env, sock, ri_data, ri_data_len, ri_flags,
@@ -2002,12 +2140,13 @@ convert_iovec_app_to_buffer(wasm_module_inst_t module_inst,
     for (i = 0; i < si_data_len; i++, si_data++) {
         char *native_addr;
 
-        if (!validate_app_addr(si_data->buf_offset, si_data->buf_len)) {
+        if (!validate_app_addr((uint64)si_data->buf_offset,
+                               (uint64)si_data->buf_len)) {
             wasm_runtime_free(*buf_ptr);
             return __WASI_EINVAL;
         }
 
-        native_addr = (char *)addr_app_to_native(si_data->buf_offset);
+        native_addr = (char *)addr_app_to_native((uint64)si_data->buf_offset);
         bh_memcpy_s(buf, si_data->buf_len, native_addr, si_data->buf_len);
         buf += si_data->buf_len;
     }
@@ -2026,7 +2165,7 @@ wasi_sock_send(wasm_exec_env_t exec_env, wasi_fd_t sock,
      **/
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     uint64 buf_size = 0;
     uint8 *buf = NULL;
     wasi_errno_t err;
@@ -2036,7 +2175,7 @@ wasi_sock_send(wasm_exec_env_t exec_env, wasi_fd_t sock,
         return __WASI_EINVAL;
     }
 
-    if (!validate_native_addr(so_data_len, sizeof(uint32)))
+    if (!validate_native_addr(so_data_len, (uint64)sizeof(uint32)))
         return __WASI_EINVAL;
 
     err = convert_iovec_app_to_buffer(module_inst, si_data, si_data_len, &buf,
@@ -2045,7 +2184,8 @@ wasi_sock_send(wasm_exec_env_t exec_env, wasi_fd_t sock,
         return err;
 
     *so_data_len = 0;
-    err = wasmtime_ssp_sock_send(curfds, sock, buf, buf_size, &send_bytes);
+    err = wasmtime_ssp_sock_send(exec_env, curfds, sock, buf, buf_size,
+                                 &send_bytes);
     *so_data_len = (uint32)send_bytes;
 
     wasm_runtime_free(buf);
@@ -2065,18 +2205,18 @@ wasi_sock_send_to(wasm_exec_env_t exec_env, wasi_fd_t sock,
      **/
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
     uint64 buf_size = 0;
     uint8 *buf = NULL;
     wasi_errno_t err;
     size_t send_bytes = 0;
-    struct addr_pool *addr_pool = wasi_ctx_get_addr_pool(module_inst, wasi_ctx);
+    struct addr_pool *addr_pool = wasi_ctx_get_addr_pool(wasi_ctx);
 
     if (!wasi_ctx) {
         return __WASI_EINVAL;
     }
 
-    if (!validate_native_addr(so_data_len, sizeof(uint32)))
+    if (!validate_native_addr(so_data_len, (uint64)sizeof(uint32)))
         return __WASI_EINVAL;
 
     err = convert_iovec_app_to_buffer(module_inst, si_data, si_data_len, &buf,
@@ -2085,8 +2225,8 @@ wasi_sock_send_to(wasm_exec_env_t exec_env, wasi_fd_t sock,
         return err;
 
     *so_data_len = 0;
-    err = wasmtime_ssp_sock_send_to(curfds, addr_pool, sock, buf, buf_size,
-                                    si_flags, dest_addr, &send_bytes);
+    err = wasmtime_ssp_sock_send_to(exec_env, curfds, addr_pool, sock, buf,
+                                    buf_size, si_flags, dest_addr, &send_bytes);
     *so_data_len = (uint32)send_bytes;
 
     wasm_runtime_free(buf);
@@ -2099,17 +2239,19 @@ wasi_sock_shutdown(wasm_exec_env_t exec_env, wasi_fd_t sock, wasi_sdflags_t how)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
     wasi_ctx_t wasi_ctx = get_wasi_ctx(module_inst);
-    struct fd_table *curfds = wasi_ctx_get_curfds(module_inst, wasi_ctx);
+    struct fd_table *curfds = wasi_ctx_get_curfds(wasi_ctx);
 
     if (!wasi_ctx)
         return __WASI_EINVAL;
 
-    return wasmtime_ssp_sock_shutdown(curfds, sock);
+    return wasmtime_ssp_sock_shutdown(exec_env, curfds, sock);
 }
 
 static wasi_errno_t
 wasi_sched_yield(wasm_exec_env_t exec_env)
 {
+    (void)exec_env;
+
     return wasmtime_ssp_sched_yield();
 }
 

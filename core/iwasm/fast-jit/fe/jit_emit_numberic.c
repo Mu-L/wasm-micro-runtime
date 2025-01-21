@@ -298,7 +298,15 @@ fail:
 
 /* macros for integer binary operations (ibinop) */
 
+#if defined(__GNUC__)
+#define NO_SANITIZER_INTEGER \
+    __attribute__((no_sanitize("signed-integer-overflow")))
+#else
+#define NO_SANITIZER_INTEGER
+#endif
+
 #define __DEF_BI_INT_CONST_OPS(bits, opname, op)                               \
+    NO_SANITIZER_INTEGER                                                       \
     static int##bits do_i##bits##_const_##opname(int##bits lhs, int##bits rhs) \
     {                                                                          \
         return lhs op rhs;                                                     \
@@ -1058,13 +1066,15 @@ DEF_UNI_INT_CONST_OPS(shru)
 static int32
 do_i32_const_shl(int32 lhs, int32 rhs)
 {
+    rhs &= 31;
     return (int32)((uint32)lhs << (uint32)rhs);
 }
 
 static int64
 do_i64_const_shl(int64 lhs, int64 rhs)
 {
-    return (int32)((uint64)lhs << (uint64)rhs);
+    rhs &= 63LL;
+    return (uint64)lhs << (uint64)rhs;
 }
 
 DEF_BI_INT_CONST_OPS(shrs, >>)
@@ -1072,12 +1082,14 @@ DEF_BI_INT_CONST_OPS(shrs, >>)
 static int32
 do_i32_const_shru(int32 lhs, int32 rhs)
 {
+    rhs &= 31;
     return (uint32)lhs >> rhs;
 }
 
 static int64
 do_i64_const_shru(int64 lhs, int64 rhs)
 {
+    rhs &= 63LL;
     return (uint64)lhs >> rhs;
 }
 
