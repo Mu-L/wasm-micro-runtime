@@ -1,7 +1,7 @@
 # Copyright (C) 2019 Intel Corporation.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-name: compilation on macos-latest
+name: compilation on macos
 
 on:
   # will be triggered on PR events
@@ -10,7 +10,8 @@ on:
       - opened
       - synchronize
     paths:
-      - ".github/**"
+      - ".github/workflows/build_llvm_libraries.yml"
+      - ".github/workflows/compilation_on_macos.yml"
       - "build-scripts/**"
       - "core/**"
       - "!core/deps/**"
@@ -19,14 +20,14 @@ on:
       - "!samples/workload/**"
       - "tests/wamr-test-suites/**"
       - "wamr-compiler/**"
-      - "wamr-sdk/**"
   # will be triggered on push events
   push:
     branches:
       - main
       - "dev/**"
     paths:
-      - ".github/**"
+      - ".github/workflows/build_llvm_libraries.yml"
+      - ".github/workflows/compilation_on_macos.yml"
       - "build-scripts/**"
       - "core/**"
       - "!core/deps/**"
@@ -35,7 +36,6 @@ on:
       - "!samples/workload/**"
       - "tests/wamr-test-suites/**"
       - "wamr-compiler/**"
-      - "wamr-sdk/**"
   # allow to be triggered manually
   workflow_dispatch:
 
@@ -51,27 +51,43 @@ env:
   FAST_INTERP_BUILD_OPTIONS: "-DWAMR_BUILD_AOT=0 -DWAMR_BUILD_FAST_INTERP=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_JIT=0 -DWAMR_BUILD_LAZY_JIT=0"
   LLVM_LAZY_JIT_BUILD_OPTIONS: "-DWAMR_BUILD_AOT=1 -DWAMR_BUILD_FAST_INTERP=0 -DWAMR_BUILD_INTERP=0 -DWAMR_BUILD_JIT=1 -DWAMR_BUILD_LAZY_JIT=1"
   LLVM_EAGER_JIT_BUILD_OPTIONS: "-DWAMR_BUILD_AOT=1 -DWAMR_BUILD_FAST_INTERP=0 -DWAMR_BUILD_INTERP=0 -DWAMR_BUILD_JIT=1 -DWAMR_BUILD_LAZY_JIT=0"
-  LLVM_CACHE_SUFFIX: "build-llvm_libraries_ex"
+
+permissions:
+  contents: read
 
 jobs:
-  build_llvm_libraries:
+  build_llvm_libraries_on_intel_macos:
+    permissions:
+      contents: read
+      actions: write
     uses: ./.github/workflows/build_llvm_libraries.yml
     with:
-      runs-on: "['macos-latest']"
+      os: "macos-13"
+      arch: "X86"
+  build_llvm_libraries_on_arm_macos:
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/build_llvm_libraries.yml
+    with:
+      os: "macos-14"
+      arch: "AArch64 ARM"
 
   build_wamrc:
-    needs: [build_llvm_libraries]
+    needs: [build_llvm_libraries_on_intel_macos]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [macos-latest]
+        include:
+          - os: macos-13
+            llvm_cache_key: ${{ needs.build_llvm_libraries_on_intel_macos.outputs.cache_key }}
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Get LLVM libraries
-        id: cache_llvm
-        uses: actions/cache@v3
+        id: retrieve_llvm_libs
+        uses: actions/cache@v4
         with:
           path: |
             ./core/deps/llvm/build/bin
@@ -79,10 +95,10 @@ jobs:
             ./core/deps/llvm/build/lib
             ./core/deps/llvm/build/libexec
             ./core/deps/llvm/build/share
-          key: ${{ matrix.os }}-${{ env.LLVM_CACHE_SUFFIX }}
+          key: ${{ matrix.llvm_cache_key }}
 
       - name: Quit if cache miss
-        if: steps.cache_llvm.outputs.cache-hit != 'true'
+        if: steps.retrieve_llvm_libs.outputs.cache-hit != 'true'
         run: echo "::error::can not get prebuilt llvm libraries" && exit 1
 
       - name: Build wamrc
@@ -93,7 +109,7 @@ jobs:
         working-directory: wamr-compiler
 
   build_iwasm:
-    needs: [build_llvm_libraries]
+    needs: [build_llvm_libraries_on_intel_macos]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -113,6 +129,7 @@ jobs:
             "-DWAMR_BUILD_DEBUG_INTERP=1",
             "-DWAMR_BUILD_DUMP_CALL_STACK=1",
             "-DWAMR_BUILD_LIB_PTHREAD=1",
+            "-DWAMR_BUILD_LIB_WASI_THREADS=1",
             "-DWAMR_BUILD_LOAD_CUSTOM_SECTION=1",
             "-DWAMR_BUILD_MINI_LOADER=1",
             "-DWAMR_BUILD_MEMORY_PROFILING=1",
@@ -123,17 +140,15 @@ jobs:
             "-DWAMR_BUILD_TAIL_CALL=1",
             "-DWAMR_DISABLE_HW_BOUND_CHECK=1",
           ]
-        os: [macos-latest]
+        os: [macos-13]
         platform: [darwin]
         exclude:
-          # uncompatiable feature and platform
-          # uncompatiable mode and feature
-          # MULTI_MODULE only on INTERP mode
+          # incompatible feature and platform
+          # incompatible mode and feature
+          # MULTI_MODULE only on INTERP mode and AOT mode
           - make_options_run_mode: $LLVM_LAZY_JIT_BUILD_OPTIONS
             make_options_feature: "-DWAMR_BUILD_MULTI_MODULE=1"
           - make_options_run_mode: $LLVM_EAGER_JIT_BUILD_OPTIONS
-            make_options_feature: "-DWAMR_BUILD_MULTI_MODULE=1"
-          - make_options_run_mode: $AOT_BUILD_OPTIONS
             make_options_feature: "-DWAMR_BUILD_MULTI_MODULE=1"
           # SIMD only on JIT/AOT mode
           - make_options_run_mode: $CLASSIC_INTERP_BUILD_OPTIONS
@@ -166,15 +181,18 @@ jobs:
             make_options_feature: "-DWAMR_BUILD_MINI_LOADER=1"
           - make_options_run_mode: $LLVM_EAGER_JIT_BUILD_OPTIONS
             make_options_feature: "-DWAMR_BUILD_MINI_LOADER=1"
+        include:
+          - os: macos-13
+            llvm_cache_key: ${{ needs.build_llvm_libraries_on_intel_macos.outputs.cache_key }}
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       # only download llvm cache when needed
       - name: Get LLVM libraries
-        id: cache_llvm
+        id: retrieve_llvm_libs
         if: endsWith(matrix.make_options_run_mode, '_JIT_BUILD_OPTIONS')
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ./core/deps/llvm/build/bin
@@ -182,10 +200,10 @@ jobs:
             ./core/deps/llvm/build/lib
             ./core/deps/llvm/build/libexec
             ./core/deps/llvm/build/share
-          key: ${{ matrix.os }}-${{ env.LLVM_CACHE_SUFFIX }}
+          key: ${{ matrix.llvm_cache_key }}
 
       - name: Quit if cache miss
-        if: endsWith(matrix.make_options_run_mode, '_JIT_BUILD_OPTIONS') && (steps.cache_llvm.outputs.cache-hit != 'true')
+        if: endsWith(matrix.make_options_run_mode, '_JIT_BUILD_OPTIONS') && (steps.retrieve_llvm_libs.outputs.cache-hit != 'true')
         run: echo "::error::can not get prebuilt llvm libraries" && exit 1
 
       - name: Build iwasm
@@ -209,62 +227,69 @@ jobs:
             #$LLVM_EAGER_JIT_BUILD_OPTIONS,
             #$AOT_BUILD_OPTIONS,
           ]
-        os: [macos-latest]
-        wasi_sdk_release: ["https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-12/wasi-sdk-12.0-macos.tar.gz"]
-        wabt_release: ["https://github.com/WebAssembly/wabt/releases/download/1.0.24/wabt-1.0.24-macos.tar.gz"]
+        os: [macos-13]
+        wasi_sdk_release:
+          [
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-20/wasi-sdk-20.0-macos.tar.gz",
+          ]
+        wabt_release:
+          [
+            "https://github.com/WebAssembly/wabt/releases/download/1.0.31/wabt-1.0.31-macos-12.tar.gz",
+          ]
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: download and install wabt
         run: |
           cd /opt
           sudo wget ${{ matrix.wabt_release }}
-          sudo tar -xzf wabt-1.0.24-*.tar.gz
-          sudo mv wabt-1.0.24 wabt
+          sudo tar -xzf wabt-1.0.31-*.tar.gz
+          sudo mv wabt-1.0.31 wabt
 
       - name: Build Sample [wasm-c-api]
         run: |
-          mkdir build && cd build
-          cmake .. ${{ matrix.make_options }}
-          cmake --build . --config Release --parallel 4
-          ./callback
-          ./callback_chain
-          ./empty_imports
-          ./global
-          ./hello
-          ./hostref
-          ./memory
-          ./reflect
-          ./table
-          ./trap
+          cmake -S . -B build ${{ matrix.make_options }}
+          cmake --build build --config Release --parallel 4
+          ctest --test-dir build --output-on-failure
         working-directory: samples/wasm-c-api
 
   build_samples_others:
-    needs: [build_iwasm]
+    needs: [build_iwasm, build_wamrc, build_llvm_libraries_on_intel_macos, build_llvm_libraries_on_arm_macos]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [macos-latest]
-        wasi_sdk_release: ["https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-12/wasi-sdk-12.0-macos.tar.gz"]
-        wabt_release: ["https://github.com/WebAssembly/wabt/releases/download/1.0.24/wabt-1.0.24-macos.tar.gz"]
+        os: [macos-13, macos-14]
+        wasi_sdk_release:
+          [
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-20/wasi-sdk-20.0-macos.tar.gz",
+          ]
+        wabt_release:
+          [
+            "https://github.com/WebAssembly/wabt/releases/download/1.0.31/wabt-1.0.31-macos-12.tar.gz",
+          ]
+        include:
+          - os: macos-13
+            llvm_cache_key: ${{ needs.build_llvm_libraries_on_intel_macos.outputs.cache_key }}
+          - os: macos-14
+            llvm_cache_key: ${{ needs.build_llvm_libraries_on_arm_macos.outputs.cache_key }}
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: download and install wasi-sdk
         run: |
           cd /opt
           sudo wget ${{ matrix.wasi_sdk_release }}
-          sudo tar -xzf wasi-sdk-12.0-*.tar.gz
-          sudo mv wasi-sdk-12.0 wasi-sdk
+          sudo tar -xzf wasi-sdk-*.tar.gz
+          sudo ln -sf wasi-sdk-20.0 wasi-sdk
 
       - name: download and install wabt
         run: |
           cd /opt
           sudo wget ${{ matrix.wabt_release }}
-          sudo tar -xzf wabt-1.0.24-*.tar.gz
-          sudo mv wabt-1.0.24 wabt
+          sudo tar -xzf wabt-1.0.31-*.tar.gz
+          sudo ln -sf wabt-1.0.31 wabt
 
       - name: Build Sample [basic]
         run: |
@@ -277,7 +302,7 @@ jobs:
           cd samples/file
           mkdir build && cd build
           cmake ..
-          cmake --build . --config Release --parallel 4
+          cmake --build . --config Debug --parallel 4
           ./src/iwasm -f wasm-app/file.wasm -d .
 
       - name: Build Sample [multi-thread]
@@ -285,7 +310,7 @@ jobs:
           cd samples/multi-thread
           mkdir build && cd build
           cmake ..
-          cmake --build . --config Release --parallel 4
+          cmake --build . --config Debug --parallel 4
           ./iwasm wasm-apps/test.wasm
 
       - name: Build Sample [multi-module]
@@ -293,15 +318,15 @@ jobs:
           cd samples/multi-module
           mkdir build && cd build
           cmake ..
-          cmake --build . --config Release --parallel 4
-          ./multi_module
+          cmake --build . --config Debug --parallel 4
+          ./multi_module mC.wasm
 
       - name: Build Sample [spawn-thread]
         run: |
           cd samples/spawn-thread
           mkdir build && cd build
           cmake ..
-          cmake --build . --config Release --parallel 4
+          cmake --build . --config Debug --parallel 4
           ./spawn_thread
 
       - name: Build Sample [ref-types]
@@ -309,5 +334,73 @@ jobs:
           cd samples/ref-types
           mkdir build && cd build
           cmake ..
-          cmake --build . --config Release --parallel 4
+          cmake --build . --config Debug --parallel 4
           ./hello
+
+      - name: Get LLVM libraries
+        id: retrieve_llvm_libs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ./core/deps/llvm/build/bin
+            ./core/deps/llvm/build/include
+            ./core/deps/llvm/build/lib
+            ./core/deps/llvm/build/libexec
+            ./core/deps/llvm/build/share
+          key: ${{ matrix.llvm_cache_key }}
+
+      - name: Build wamrc
+        run: |
+          mkdir build && cd build
+          cmake ..
+          cmake --build . --config Release --parallel 4
+        working-directory: wamr-compiler
+
+      - name: Build Sample [wasi-threads]
+        run: |
+          cd samples/wasi-threads
+          mkdir build && cd build
+          cmake ..
+          cmake --build . --config Debug --parallel 4
+          ./iwasm wasm-apps/no_pthread.wasm
+
+          ../../../wamr-compiler/build/wamrc --size-level=0 --enable-multi-thread -o wasm-apps/no_pthread.aot wasm-apps/no_pthread.wasm
+          ./iwasm wasm-apps/no_pthread.aot
+
+      - name: Build Sample [shared-module]
+        run: |
+          cd samples/shared-module
+          ./build.sh
+          ./run.sh
+
+      - name: Build Sample [terminate]
+        run: |
+          cd samples/terminate
+          ./build.sh
+          ./run.sh
+
+      - name: Build Sample [debug-tools]
+        run: |
+          cd samples/debug-tools
+          mkdir build && cd build
+          cmake ..
+          cmake --build . --config Debug --parallel 4
+          ./iwasm wasm-apps/trap.wasm | grep "#" > call_stack.txt
+          ./iwasm wasm-apps/trap.aot | grep "#" > call_stack_aot.txt
+          bash -x ../symbolicate.sh
+
+      - name: Build Sample [native-stack-overflow]
+        run: |
+          cd samples/native-stack-overflow
+          ./build.sh
+          ./run.sh test1
+          ./run.sh test2
+
+      - name: Build Sample [shared-heap]
+        run: |
+          cd samples/shared-heap
+          mkdir build && cd build
+          cmake ..
+          cmake --build . --config Debug --parallel 4
+          ./shared_heap_test
+          ./shared_heap_test --aot

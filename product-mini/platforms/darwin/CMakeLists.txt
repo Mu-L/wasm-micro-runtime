@@ -34,7 +34,7 @@ if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif ()
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 
 if (NOT DEFINED WAMR_BUILD_INTERP)
   # Enable Interpreter by default
@@ -89,6 +89,11 @@ endif ()
 if (NOT DEFINED WAMR_BUILD_SIMD)
   # Enable SIMD by default
   set (WAMR_BUILD_SIMD 1)
+endif ()
+
+if (NOT DEFINED WAMR_BUILD_REF_TYPES)
+  # Enable reference types by default
+  set (WAMR_BUILD_REF_TYPES 1)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_DEBUG_INTERP)

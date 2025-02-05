@@ -6,7 +6,7 @@ how they communicate with each other.
 
 ## Preparation
 
-Please install WASI SDK, download the [wasi-sdk release](https://github.com/CraneStation/wasi-sdk/releases) and extract the archive to default path `/opt/wasi-sdk`.
+Please install WASI SDK, download the [wasi-sdk release](https://github.com/WebAssembly/wasi-sdk/releases) and extract the archive to default path `/opt/wasi-sdk`.
 And install wabt, download the [wabt release](https://github.com/WebAssembly/wabt/releases) and extract the archive to default path `/opt/wabt`
 
 ## Build the sample
@@ -68,7 +68,7 @@ Say Hi from the Server
 send and receive data via 127.0.0.1:1234.
 
 ```bash
-$ ./iwasm --addr-pool=127.0.0.1/0  ./send_recv.wasm
+$ ./iwasm --addr-pool=127.0.0.1/0 ./send_recv.wasm
 ```
 
 The output is:
@@ -121,7 +121,7 @@ Shuting down
 ```
 
 ```bash
-$ ./iwasm --addr-pool=127.0.0.1/15 --heap-size=10000000 timeout_client.wasm
+$ ./iwasm --addr-pool=127.0.0.1/15 timeout_client.wasm
 ```
 
 The output is:
@@ -164,7 +164,7 @@ Datagram sent
 
 `addr_resolve.wasm` demonstrates the usage of resolving a domain name
 ```
-$ ./iwasm --allow-resolve=*.com addr_resolve.wasm  github.com
+$ ./iwasm --allow-resolve=*.com addr_resolve.wasm github.com
 ```
 
 The command displays the host name and its corresponding IP address:
