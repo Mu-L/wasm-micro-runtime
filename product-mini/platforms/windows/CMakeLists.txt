@@ -4,7 +4,6 @@
 cmake_minimum_required (VERSION 2.9)
 
 project (iwasm C ASM CXX)
-enable_language(ASM_MASM)
 # set (CMAKE_VERBOSE_MAKEFILE 1)
 
 set (WAMR_BUILD_PLATFORM "windows")
@@ -12,8 +11,6 @@ set (WAMR_BUILD_PLATFORM "windows")
 # Reset default linker flags
 set (CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
 set (CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "")
-
-set (CMAKE_C_STANDARD 99)
 
 add_definitions(-DCOMPILING_WASM_RUNTIME_API=1)
 
@@ -55,9 +52,9 @@ if (NOT DEFINED WAMR_BUILD_LIBC_BUILTIN)
   set (WAMR_BUILD_LIBC_BUILTIN 1)
 endif ()
 
-if (NOT DEFINED WAMR_BUILD_LIBC_UVWASI)
-  # Enable libc uvwasi support by default
-  set (WAMR_BUILD_LIBC_UVWASI 1)
+if (NOT DEFINED WAMR_BUILD_LIBC_WASI)
+  # Enable libc wasi support by default
+  set (WAMR_BUILD_LIBC_WASI 1)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_FAST_INTERP)
@@ -96,17 +93,22 @@ if (WAMR_BUILD_DEBUG_INTERP EQUAL 1)
   set (WAMR_BUILD_SIMD 0)
 endif ()
 
-if (COLLECT_CODE_COVERAGE EQUAL 1)
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
-endif ()
+if (WAMR_BUILD_LIBC_WASI EQUAL 1)
+  set (CMAKE_C_STANDARD 11)
+  if (MSVC)
+    add_compile_options(/experimental:c11atomics)
+  endif()
+else()
+  set (CMAKE_C_STANDARD 99)
+endif()
 
 set (WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
 
 include (${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 add_library(vmlib ${WAMR_RUNTIME_LIB_SOURCE})
+set_version_info(vmlib)
 
 #set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DWIN32_LEAN_AND_MEAN")
-set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_WINSOCK_DEPRECATED_NO_WARNINGS")
 if (NOT MINGW)
   set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /SAFESEH:NO")
   set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /SAFESEH:NO")
@@ -133,6 +135,8 @@ include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 
 add_executable (iwasm main.c ${UNCOMMON_SHARED_SOURCE})
 
+set_version_info (iwasm)
+
 install (TARGETS iwasm DESTINATION bin)
 
 target_link_libraries (iwasm vmlib ${LLVM_AVAILABLE_LIBS} ${UV_A_LIBS})
@@ -143,6 +147,8 @@ endif ()
 
 add_library (libiwasm SHARED ${WAMR_RUNTIME_LIB_SOURCE})
 
+set_version_info (libiwasm)
+
 install (TARGETS libiwasm DESTINATION lib)
 
 set_target_properties (libiwasm PROPERTIES OUTPUT_NAME libiwasm)
@@ -152,3 +158,9 @@ target_link_libraries (libiwasm ${LLVM_AVAILABLE_LIBS} ${UV_A_LIBS})
 if (MINGW)
   target_link_libraries (libiwasm ws2_32)
 endif ()
+
+if (WIN32)
+  target_link_libraries(libiwasm ntdll)
+
+  target_link_libraries(iwasm ntdll)  
+endif()

@@ -16,6 +16,7 @@ set (CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
 set (CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "")
 
 set (CMAKE_C_STANDARD 99)
+set (CMAKE_CXX_STANDARD 17)
 
 # Set WAMR_BUILD_TARGET, currently values supported:
 # "X86_64", "AMD_64", "X86_32", "AARCH64[sub]", "ARM[sub]", "THUMB[sub]",
@@ -23,11 +24,17 @@ set (CMAKE_C_STANDARD 99)
 if (NOT DEFINED WAMR_BUILD_TARGET)
   if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)")
     set (WAMR_BUILD_TARGET "AARCH64")
+    if (NOT DEFINED WAMR_BUILD_SIMD)
+      set (WAMR_BUILD_SIMD 1)
+    endif ()
   elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
     set (WAMR_BUILD_TARGET "RISCV64")
   elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
     # Build as X86_64 by default in 64-bit platform
     set (WAMR_BUILD_TARGET "X86_64")
+    if (NOT DEFINED WAMR_BUILD_SIMD)
+      set (WAMR_BUILD_SIMD 1)
+    endif ()
   elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
     # Build as X86_32 by default in 32-bit platform
     set (WAMR_BUILD_TARGET "X86_32")
@@ -85,6 +92,11 @@ if (NOT DEFINED WAMR_BUILD_LIB_PTHREAD)
   set (WAMR_BUILD_LIB_PTHREAD 0)
 endif ()
 
+if (NOT DEFINED WAMR_BUILD_LIB_WASI_THREADS)
+  # Disable wasi threads library by default
+  set (WAMR_BUILD_LIB_WASI_THREADS 0)
+endif()
+
 if (NOT DEFINED WAMR_BUILD_MINI_LOADER)
   # Disable wasm mini loader by default
   set (WAMR_BUILD_MINI_LOADER 0)
@@ -96,8 +108,8 @@ if (NOT DEFINED WAMR_BUILD_SIMD)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_REF_TYPES)
-  # Disable reference types by default
-  set (WAMR_BUILD_REF_TYPES 0)
+  # Enable reference types by default
+  set (WAMR_BUILD_REF_TYPES 1)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_DEBUG_INTERP)
@@ -111,15 +123,26 @@ if (WAMR_BUILD_DEBUG_INTERP EQUAL 1)
   set (WAMR_BUILD_SIMD 0)
 endif ()
 
-if (COLLECT_CODE_COVERAGE EQUAL 1)
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage")
+# if enable wasi-nn, both wasi-nn-backends and iwasm
+# need to use same WAMR (dynamic) libraries
+if (WAMR_BUILD_WASI_NN EQUAL 1)
+  set (WAMR_BUILD_SHARED 1)
+endif ()
+
+if (NOT DEFINED WAMR_BUILD_SHARED)
+  set (WAMR_BUILD_SHARED 0)
+elseif (WAMR_BUILD_SHARED EQUAL 1)
+  message ("build WAMR as shared libraries")
 endif ()
 
 set (WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
 
 include (${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
+
+check_pie_supported()
 add_library(vmlib ${WAMR_RUNTIME_LIB_SOURCE})
+set_target_properties (vmlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_version_info (vmlib)
 
 set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 
@@ -133,24 +156,6 @@ if (WAMR_BUILD_TARGET MATCHES "X86_.*" OR WAMR_BUILD_TARGET STREQUAL "AMD_64")
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mindirect-branch-register")
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mindirect-branch-register")
     # UNDEFINED BEHAVIOR, refer to https://en.cppreference.com/w/cpp/language/ub
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT WAMR_BUILD_JIT EQUAL 1)
-      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined \
-                                          -fno-sanitize=bounds,bounds-strict,alignment \
-                                          -fno-sanitize-recover")
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined \
-                                              -fno-sanitize=bounds,bounds-strict,alignment \
-                                              -fno-sanitize-recover")
-    endif()
-  else ()
-    # UNDEFINED BEHAVIOR, refer to https://en.cppreference.com/w/cpp/language/ub
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT WAMR_BUILD_JIT EQUAL 1)
-      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined \
-                                          -fno-sanitize=bounds,alignment \
-                                          -fno-sanitize-recover")
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined \
-                                              -fno-sanitize=bounds,alignment \
-                                              -fno-sanitize-recover")
-    endif()
   endif ()
 endif ()
 
@@ -166,14 +171,24 @@ include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 
 add_executable (iwasm main.c ${UNCOMMON_SHARED_SOURCE})
 
-check_pie_supported()
+set_version_info (iwasm)
+
 set_target_properties (iwasm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+target_link_libraries(iwasm
+  $<$<BOOL:${WAMR_BUILD_SHARED}>:libiwasm> $<$<NOT:$<BOOL:${WAMR_BUILD_SHARED}>>:vmlib>
+  ${LLVM_AVAILABLE_LIBS}
+  ${UV_A_LIBS}
+  -lm
+  -ldl
+  -lpthread
+)
 
 install (TARGETS iwasm DESTINATION bin)
 
-target_link_libraries (iwasm vmlib ${LLVM_AVAILABLE_LIBS} ${UV_A_LIBS} -lm -ldl -lpthread)
-
 add_library (libiwasm SHARED ${WAMR_RUNTIME_LIB_SOURCE})
+
+set_version_info (libiwasm)
 
 install (TARGETS libiwasm DESTINATION lib)
 

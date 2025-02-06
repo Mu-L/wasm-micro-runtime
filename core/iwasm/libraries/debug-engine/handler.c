@@ -309,9 +309,11 @@ handle_general_query(WASMGDBServer *server, char *payload)
     }
 
     if (!strcmp(name, "WasmData")) {
+        write_packet(server, "");
     }
 
     if (!strcmp(name, "WasmMem")) {
+        write_packet(server, "");
     }
 
     if (!strcmp(name, "Symbol")) {
@@ -447,7 +449,7 @@ send_thread_stop_status(WASMGDBServer *server, uint32 status, korp_tid tid)
                             "thread-pcs:%" PRIx64 ";00:%s;reason:%s;", pc,
                             pc_string, "trace");
         }
-        else if (status > 0) {
+        else { /* status > 0 (== 0 is checked at the function beginning) */
             len += snprintf(tmpbuf + len, MAX_PACKET_SIZE - len,
                             "thread-pcs:%" PRIx64 ";00:%s;reason:%s;", pc,
                             pc_string, "signal");
@@ -731,7 +733,7 @@ handle_add_break(WASMGDBServer *server, char *payload)
             handle_watchpoint_read_add(server, addr, length);
             break;
         default:
-            LOG_ERROR("Unsupported breakpoint type %d", type);
+            LOG_ERROR("Unsupported breakpoint type %zu", type);
             write_packet(server, "");
             break;
     }
@@ -766,7 +768,7 @@ handle_remove_break(WASMGDBServer *server, char *payload)
             handle_watchpoint_read_remove(server, addr, length);
             break;
         default:
-            LOG_ERROR("Unsupported breakpoint type %d", type);
+            LOG_ERROR("Unsupported breakpoint type %zu", type);
             write_packet(server, "");
             break;
     }

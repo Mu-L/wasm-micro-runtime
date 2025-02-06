@@ -13,6 +13,10 @@
 #include "../aot/aot_runtime.h"
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #if WASM_ENABLE_AOT == 0
 typedef enum IntCond {
     INT_EQZ = 0,
@@ -104,6 +108,17 @@ typedef enum FloatArithmetic {
     FLOAT_MAX,
 } FloatArithmetic;
 
+#if WASM_ENABLE_SHARED_MEMORY != 0
+typedef enum AtomicRMWBinOp {
+    AtomicRMWBinOpAdd,
+    AtomicRMWBinOpSub,
+    AtomicRMWBinOpAnd,
+    AtomicRMWBinOpOr,
+    AtomicRMWBinOpXor,
+    AtomicRMWBinOpXchg
+} AtomicRMWBinOp;
+#endif
+
 /**
  * Translate instructions in a function. The translated block must
  * end with a branch instruction whose targets are offsets relating to
@@ -144,6 +159,9 @@ bool
 jit_frontend_lower(JitCompContext *cc);
 
 uint32
+jit_frontend_get_jitted_return_addr_offset();
+
+uint32
 jit_frontend_get_global_data_offset(const WASMModule *module,
                                     uint32 global_idx);
 
@@ -173,6 +191,12 @@ get_aux_stack_bound_reg(JitFrame *frame);
 
 JitReg
 get_aux_stack_bottom_reg(JitFrame *frame);
+
+JitReg
+get_memory_inst_reg(JitFrame *frame, uint32 mem_idx);
+
+JitReg
+get_cur_page_count_reg(JitFrame *frame, uint32 mem_idx);
 
 JitReg
 get_memory_data_reg(JitFrame *frame, uint32 mem_idx);
@@ -482,5 +506,9 @@ set_local_f64(JitFrame *frame, int n, JitReg val)
 #define PUSH_F64(v) PUSH(v, VALUE_TYPE_F64)
 #define PUSH_FUNCREF(v) PUSH(v, VALUE_TYPE_FUNCREF)
 #define PUSH_EXTERNREF(v) PUSH(v, VALUE_TYPE_EXTERNREF)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

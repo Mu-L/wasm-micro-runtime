@@ -16,6 +16,10 @@ if (NOT DEFINED WAMR_BUILD_TARGET)
   if (CMAKE_SIZEOF_VOID_P EQUAL 8)
     # Build as X86_64 by default in 64-bit platform
     set (WAMR_BUILD_TARGET "X86_64")
+    if (NOT DEFINED WAMR_BUILD_SIMD)
+      # Enable SIMD by default in 64-bit platform
+      set (WAMR_BUILD_SIMD 1)
+    endif ()
   elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
     # Build as X86_32 by default in 32-bit platform
     set (WAMR_BUILD_TARGET "X86_32")
@@ -89,8 +93,9 @@ if (NOT DEFINED WAMR_BUILD_SGX_IPFS)
   set (WAMR_BUILD_SGX_IPFS 0)
 endif ()
 
-if (COLLECT_CODE_COVERAGE EQUAL 1)
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
+if (NOT DEFINED WAMR_BUILD_STATIC_PGO)
+  # Disable static PGO by default
+  set (WAMR_BUILD_STATIC_PGO 0)
 endif ()
 
 set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
@@ -102,6 +107,7 @@ set (WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
 
 include (${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 add_library(vmlib ${WAMR_RUNTIME_LIB_SOURCE})
+set_version_info (vmlib)
 
 add_custom_command (
              OUTPUT libvmlib_untrusted.a
@@ -110,6 +116,18 @@ add_custom_command (
              COMMAND ${CMAKE_AR} rc libvmlib_untrusted.a untrusted/*.o)
 
 add_custom_target (vmlib_untrusted ALL DEPENDS libvmlib_untrusted.a)
+
+if ((WAMR_BUILD_STATIC_PGO EQUAL 1) AND (WAMR_BUILD_AOT EQUAL 1))
+    execute_process(
+        COMMAND bash -c "sed -i -E 's/^WAMR_BUILD_STATIC_PGO = 0/WAMR_BUILD_STATIC_PGO = 1/g' ${CMAKE_CURRENT_SOURCE_DIR}/enclave-sample/Makefile"
+        OUTPUT_VARIABLE cmdOutput
+    )
+else()
+    execute_process(
+        COMMAND bash -c "sed -i -E 's/^WAMR_BUILD_STATIC_PGO = 1/WAMR_BUILD_STATIC_PGO = 0/g' ${CMAKE_CURRENT_SOURCE_DIR}/enclave-sample/Makefile"
+        OUTPUT_VARIABLE cmdOutput
+    )
+endif()
 
 if (DEFINED WAMR_BUILD_GLOBAL_HEAP_POOL)
   execute_process(
@@ -148,6 +166,25 @@ else()
     execute_process(
         COMMAND bash -c "sed -i -E 's/^#define WASM_ENABLE_SGX_IPFS 1/#define WASM_ENABLE_SGX_IPFS 0/g' ${CMAKE_CURRENT_SOURCE_DIR}/enclave-sample/Enclave/Enclave.edl"
         COMMAND bash -c "sed -i -E 's/^WAMR_BUILD_SGX_IPFS = 1/WAMR_BUILD_SGX_IPFS = 0/g' ${CMAKE_CURRENT_SOURCE_DIR}/enclave-sample/Makefile"
+        OUTPUT_VARIABLE cmdOutput
+    )
+endif()
+
+if (WAMR_BUILD_LIBC_WASI EQUAL 1)
+    execute_process(
+        COMMAND bash -c "sed -i -E 's/^WAMR_BUILD_LIBC_WASI = 0/WAMR_BUILD_LIBC_WASI = 1/g' ${CMAKE_CURRENT_SOURCE_DIR}/enclave-sample/Makefile"
+        OUTPUT_VARIABLE cmdOutput
+    )
+else()
+    execute_process(
+        COMMAND bash -c "sed -i -E 's/^WAMR_BUILD_LIBC_WASI = 1/WAMR_BUILD_LIBC_WASI = 0/g' ${CMAKE_CURRENT_SOURCE_DIR}/enclave-sample/Makefile"
+        OUTPUT_VARIABLE cmdOutput
+    )
+endif()
+
+if (WAMR_BUILD_SPEC_TEST EQUAL 1)
+    execute_process(
+        COMMAND bash -c "sed -i -E 's/<ReservedMemMaxSize>0x1000000<\\/ReservedMemMaxSize>/<ReservedMemMaxSize>0x8000000<\\/ReservedMemMaxSize>/g' ${CMAKE_CURRENT_SOURCE_DIR}/enclave-sample/Enclave/Enclave.config.xml"
         OUTPUT_VARIABLE cmdOutput
     )
 endif()

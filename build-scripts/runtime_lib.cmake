@@ -10,14 +10,13 @@ endif ()
 if (NOT DEFINED IWASM_DIR)
     set (IWASM_DIR ${WAMR_ROOT_DIR}/core/iwasm)
 endif ()
-if (NOT DEFINED APP_MGR_DIR)
-    set (APP_MGR_DIR ${WAMR_ROOT_DIR}/core/app-mgr)
-endif ()
-if (NOT DEFINED APP_FRAMEWORK_DIR)
-    set (APP_FRAMEWORK_DIR ${WAMR_ROOT_DIR}/core/app-framework)
-endif ()
 if (NOT DEFINED DEPS_DIR)
     set (DEPS_DIR ${WAMR_ROOT_DIR}/core/deps)
+endif ()
+if (NOT DEFINED SHARED_PLATFORM_CONFIG)
+    # CMake file for platform configuration. The PLATFORM_SHARED_SOURCE varable
+    # should point to a list of platform-specfic source files to compile.
+    set (SHARED_PLATFORM_CONFIG ${SHARED_DIR}/platform/${WAMR_BUILD_PLATFORM}/shared_platform.cmake)
 endif ()
 
 if (DEFINED EXTRA_SDK_INCLUDE_PATH)
@@ -25,14 +24,6 @@ if (DEFINED EXTRA_SDK_INCLUDE_PATH)
     include_directories (
         ${EXTRA_SDK_INCLUDE_PATH}
     )
-endif ()
-
-# Need exactly OpenSSL 1.1.1
-if (WAMR_BUILD_WASM_CACHE EQUAL 1)
-     # Set OPENSSL_ROOT_DIR to the root directory of an OpenSSL installation.
-     # Like: cmake -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl
-     # Especially on MacOS
-    find_package(OpenSSL 1.1.1 EXACT REQUIRED)
 endif ()
 
 # Set default options
@@ -68,7 +59,12 @@ if (WAMR_BUILD_INTERP EQUAL 1)
 endif ()
 
 if (WAMR_BUILD_FAST_JIT EQUAL 1)
-    include (${IWASM_DIR}/fast-jit/iwasm_fast_jit.cmake)
+    if (WAMR_BUILD_PLATFORM STREQUAL "windows")
+        message ("Fast JIT currently not supported on Windows")
+        set (WAMR_BUILD_FAST_JIT 0)
+    else ()
+        include (${IWASM_DIR}/fast-jit/iwasm_fast_jit.cmake)
+    endif ()
 endif ()
 
 if (WAMR_BUILD_JIT EQUAL 1)
@@ -81,11 +77,14 @@ if (WAMR_BUILD_AOT EQUAL 1)
     include (${IWASM_DIR}/aot/iwasm_aot.cmake)
 endif ()
 
-if (WAMR_BUILD_APP_FRAMEWORK EQUAL 1)
-    include (${APP_FRAMEWORK_DIR}/app_framework.cmake)
-    include (${SHARED_DIR}/coap/lib_coap.cmake)
-    include (${APP_MGR_DIR}/app-manager/app_mgr.cmake)
-    include (${APP_MGR_DIR}/app-mgr-shared/app_mgr_shared.cmake)
+if (WAMR_BUILD_STRINGREF EQUAL 1)
+    set (WAMR_BUILD_GC 1)
+endif ()
+
+if (WAMR_BUILD_GC EQUAL 1)
+    include (${IWASM_DIR}/common/gc/iwasm_gc.cmake)
+    # Enable the dependent feature if GC is enabled
+    set (WAMR_BUILD_REF_TYPES 1)
 endif ()
 
 if (WAMR_BUILD_LIBC_BUILTIN EQUAL 1)
@@ -94,8 +93,10 @@ endif ()
 
 if (WAMR_BUILD_LIBC_UVWASI EQUAL 1)
     include (${IWASM_DIR}/libraries/libc-uvwasi/libc_uvwasi.cmake)
+    set (WAMR_BUILD_MODULE_INST_CONTEXT 1)
 elseif (WAMR_BUILD_LIBC_WASI EQUAL 1)
     include (${IWASM_DIR}/libraries/libc-wasi/libc_wasi.cmake)
+    set (WAMR_BUILD_MODULE_INST_CONTEXT 1)
 endif ()
 
 if (WAMR_BUILD_LIB_PTHREAD_SEMAPHORE EQUAL 1)
@@ -104,24 +105,31 @@ if (WAMR_BUILD_LIB_PTHREAD_SEMAPHORE EQUAL 1)
 endif ()
 
 if (WAMR_BUILD_WASI_NN EQUAL 1)
-    execute_process(COMMAND ${WAMR_ROOT_DIR}/core/deps/install_tensorflow.sh
-                    RESULT_VARIABLE TENSORFLOW_RESULT
-    )
-    set(TENSORFLOW_SOURCE_DIR "${WAMR_ROOT_DIR}/core/deps/tensorflow-src")
-    include_directories (${CMAKE_CURRENT_BINARY_DIR}/flatbuffers/include)
-    include_directories (${TENSORFLOW_SOURCE_DIR})
-    add_subdirectory(
-        "${TENSORFLOW_SOURCE_DIR}/tensorflow/lite"
-        "${CMAKE_CURRENT_BINARY_DIR}/tensorflow-lite" EXCLUDE_FROM_ALL)
-    include (${IWASM_DIR}/libraries/wasi-nn/wasi_nn.cmake)
+    include (${IWASM_DIR}/libraries/wasi-nn/cmake/wasi_nn.cmake)
 endif ()
 
 if (WAMR_BUILD_LIB_PTHREAD EQUAL 1)
+    if (WAMR_BUILD_PLATFORM STREQUAL "windows")
+        set (WAMR_BUILD_LIB_PTHREAD_SEMAPHORE 0)
+        message ("Lib pthread semaphore currently not supported on Windows")
+    endif ()
     include (${IWASM_DIR}/libraries/lib-pthread/lib_pthread.cmake)
     # Enable the dependent feature if lib pthread is enabled
     set (WAMR_BUILD_THREAD_MGR 1)
     set (WAMR_BUILD_BULK_MEMORY 1)
     set (WAMR_BUILD_SHARED_MEMORY 1)
+endif ()
+
+if (WAMR_BUILD_LIB_WASI_THREADS EQUAL 1)
+    include (${IWASM_DIR}/libraries/lib-wasi-threads/lib_wasi_threads.cmake)
+    # Enable the dependent feature if lib wasi threads is enabled
+    set (WAMR_BUILD_THREAD_MGR 1)
+    set (WAMR_BUILD_BULK_MEMORY 1)
+    set (WAMR_BUILD_SHARED_MEMORY 1)
+endif ()
+
+if (WAMR_BUILD_SHARED_HEAP EQUAL 1)
+    include (${IWASM_DIR}/libraries/shared-heap/shared_heap.cmake)
 endif ()
 
 if (WAMR_BUILD_DEBUG_INTERP EQUAL 1)
@@ -147,6 +155,10 @@ if (WAMR_BUILD_LIB_RATS EQUAL 1)
     include (${IWASM_DIR}/libraries/lib-rats/lib_rats.cmake)
 endif ()
 
+if (WAMR_BUILD_WASM_CACHE EQUAL 1)
+    include (${WAMR_ROOT_DIR}/build-scripts/involve_boringssl.cmake)
+endif ()
+
 ####################### Common sources #######################
 if (NOT MSVC)
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu99 -ffunction-sections -fdata-sections \
@@ -163,9 +175,13 @@ file (GLOB header
 )
 LIST (APPEND RUNTIME_LIB_HEADER_LIST ${header})
 
-enable_language (ASM)
+if (WAMR_BUILD_PLATFORM STREQUAL "windows")
+    enable_language (ASM_MASM)
+else()
+    enable_language (ASM)
+endif()
 
-include (${SHARED_DIR}/platform/${WAMR_BUILD_PLATFORM}/shared_platform.cmake)
+include (${SHARED_PLATFORM_CONFIG})
 include (${SHARED_DIR}/mem-alloc/mem_alloc.cmake)
 include (${IWASM_DIR}/common/iwasm_common.cmake)
 include (${SHARED_DIR}/utils/shared_utils.cmake)
@@ -177,20 +193,20 @@ set (source_all
     ${UTILS_SHARED_SOURCE}
     ${LIBC_BUILTIN_SOURCE}
     ${LIBC_WASI_SOURCE}
-    ${LIBC_WASI_NN_SOURCE}
+    ${WASI_NN_SOURCES}
     ${IWASM_COMMON_SOURCE}
     ${IWASM_INTERP_SOURCE}
     ${IWASM_AOT_SOURCE}
     ${IWASM_COMPL_SOURCE}
     ${IWASM_FAST_JIT_SOURCE}
-    ${WASM_APP_LIB_SOURCE_ALL}
-    ${NATIVE_INTERFACE_SOURCE}
-    ${APP_MGR_SOURCE}
+    ${IWASM_GC_SOURCE}
+    ${LIB_WASI_THREADS_SOURCE}
     ${LIB_PTHREAD_SOURCE}
     ${THREAD_MGR_SOURCE}
     ${LIBC_EMCC_SOURCE}
     ${LIB_RATS_SOURCE}
     ${DEBUG_ENGINE_SOURCE}
+    ${LIB_SHARED_HEAP_SOURCE}
 )
 
 set (WAMR_RUNTIME_LIB_SOURCE ${source_all})

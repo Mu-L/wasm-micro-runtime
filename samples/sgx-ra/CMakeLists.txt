@@ -39,10 +39,6 @@ set (WAMR_BUILD_FAST_INTERP 1)
 set (WAMR_BUILD_LIB_RATS 1)
 
 # compiling and linking flags
-if (COLLECT_CODE_COVERAGE EQUAL 1)
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
-endif ()
-
 set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu11 -ffunction-sections -fdata-sections \
                                      -Wall -Wno-unused-parameter -Wno-pedantic \
@@ -73,6 +69,7 @@ execute_process (
 add_custom_target (
               iwasm ALL
               DEPENDS vmlib_untrusted vmlib_untrusted vmlib
+              COMMAND make -C ${SGX_PLATFORM_DIR}/enclave-sample clean
               COMMAND make -C  ${SGX_PLATFORM_DIR}/enclave-sample SGX_MODE=HW SGX_DEBUG=1 VMLIB_BUILD_DIR=${CMAKE_BINARY_DIR}
               COMMAND ${CMAKE_COMMAND} -E copy ${SGX_PLATFORM_DIR}/enclave-sample/enclave.signed.so ${CMAKE_BINARY_DIR}
               COMMAND ${CMAKE_COMMAND} -E copy ${SGX_PLATFORM_DIR}/enclave-sample/iwasm ${CMAKE_BINARY_DIR}

@@ -43,8 +43,20 @@ if (NOT CMAKE_BUILD_TYPE)
 endif ()
 
 set(WAMR_BUILD_INTERP 1)
-set(WAMR_BUILD_AOT 0)
-set(WAMR_BUILD_JIT 0)
+if (NOT DEFINED WAMR_BUILD_AOT)
+  set(WAMR_BUILD_AOT 0)
+endif ()
+if (NOT DEFINED WAMR_BUILD_JIT)
+  set(WAMR_BUILD_JIT 0)
+endif ()
+if (NOT DEFINED WAMR_BUILD_DUMP_CALL_STACK)
+  set(WAMR_BUILD_DUMP_CALL_STACK 0)
+endif ()
+if (NOT DEFINED WAMR_BUILD_GC)
+  set(WAMR_BUILD_GC 0)
+endif ()
+set(WAMR_BUILD_SIMD 1)
+set(WAMR_BUILD_REF_TYPES 1)
 set(WAMR_BUILD_LIBC_BUILTIN 1)
 set(WAMR_BUILD_LIBC_WASI 1)
 set(WAMR_BUILD_MULTI_MODULE 1)
@@ -128,12 +140,14 @@ endif()
 # .c -> .wasm
 ExternalProject_Add(WASM_MODULE
   SOURCE_DIR         ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps
+  BUILD_ALWAYS TRUE
   UPDATE_COMMAND     ""
   PATCH_COMMAND      ""
   CONFIGURE_COMMAND  ${CMAKE_COMMAND}
                        -DWASI_SDK_PREFIX=${WASI_SDK_DIR}
                        -DCMAKE_TOOLCHAIN_FILE=${WASI_TOOLCHAIN_FILE}
                        -DCMAKE_SYSROOT=${WASI_SYS_ROOT}
+                       -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
                        -S ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps
   BUILD_COMMAND      ${CMAKE_COMMAND} --build .
   INSTALL_COMMAND    ${CMAKE_COMMAND} -E copy
@@ -143,6 +157,50 @@ ExternalProject_Add(WASM_MODULE
                        ./mD.wasm ${CMAKE_BINARY_DIR}
                        ./mE.wasm ${CMAKE_BINARY_DIR}
 )
+
+################ WASM MODULES TO AOT
+if (WAMR_BUILD_AOT EQUAL 1)
+  set(WAMR_COMPILER_DIR ${CMAKE_CURRENT_LIST_DIR}/../../wamr-compiler/build)
+  message(CHECK_START "Detecting WAMR_COMPILER at ${WAMR_COMPILER_DIR}")
+  find_file(WAMR_COMPILER
+    wamrc
+    PATHS "${CMAKE_CURRENT_LIST_DIR}/../../wamr-compiler/build"
+    NO_DEFAULT_PATH
+    NO_CMAKE_FIND_ROOT_PATH
+  )
+  if(WAMR_COMPILER)
+    message(CHECK_PASS "found")
+  else()
+    message(CHECK_FAIL "not found")
+  endif()
+  if((NOT EXISTS ${WAMR_COMPILER}) )
+    message(FATAL_ERROR "Please build wamrc under the path=${WAMR_ROOT_DIR}/wamr-compiler/ ")
+  else()
+    message(STATUS "WAMR_COMPILER is ${WAMR_COMPILER}")
+  endif()
+
+  if (WAMR_BUILD_DUMP_CALL_STACK EQUAL 1)
+    list(APPEND WAMR_AOT_COMPILE_OPTIONS "--enable-dump-call-stack")
+  endif ()
+  if (WAMR_BUILD_GC EQUAL 1)
+    list(APPEND WAMR_AOT_COMPILE_OPTIONS "--enable-gc")
+  endif ()
+
+  add_custom_target(
+    wasm_to_aot
+    ALL
+    DEPENDS
+    WASM_MODULE ${WAMR_COMPILER}
+    COMMAND
+    ${WAMR_COMPILER} ${WAMR_AOT_COMPILE_OPTIONS} -o mA.aot ./mA.wasm
+    COMMAND
+    ${WAMR_COMPILER} ${WAMR_AOT_COMPILE_OPTIONS} -o mB.aot ./mB.wasm
+    COMMAND
+    ${WAMR_COMPILER} ${WAMR_AOT_COMPILE_OPTIONS} -o mC.aot ./mC.wasm
+    WORKING_DIRECTORY
+    ${CMAKE_BINARY_DIR}
+  )
+endif()
 
 ################ NATIVE
 include_directories(${CMAKE_CURRENT_LIST_DIR}/src)

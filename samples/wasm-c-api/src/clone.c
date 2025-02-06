@@ -181,13 +181,13 @@ vm_clone_from_instance(const wasm_vm_t *base)
 {
     /**
      * if do a clone of the level instantiated_module, need to malloc and
-     * initialie
-     *   - global. WASMGlobalIntance and global data
-     *   - memory. WAAMMemoryInstance, memory_data and heap
+     * initialize
+     *   - global. WASMGlobalInstance and global data
+     *   - memory. WASMMemoryInstance, memory_data and heap
      *   - table. WASMTableInstance, table_data
      *   - exports. all global, memory and table
      *
-     * it is almost everything in wasm_instantiate() except funciton.
+     * it is almost everything in wasm_instantiate() except function.
      */
     (void)base;
     printf("Unsupported\n");
@@ -522,6 +522,7 @@ main()
     pthread_mutex_unlock(&ready_go_lock);
     pthread_cond_broadcast(&ready_go_cond);
 
+    sleep(3);
     for (size_t i = 0; i < sizeof(tids) / sizeof(tids[0]); i++) {
         if (tids[i] != 0)
             pthread_join(tids[i], NULL);
